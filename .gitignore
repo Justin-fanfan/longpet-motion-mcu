@@ -1,0 +1,9 @@
+.arduino-data/
+.arduino-downloads/
+.arduino-user/
+.tools/
+build/
+build-original/
+build-reliable-stop/
+*.log
+
