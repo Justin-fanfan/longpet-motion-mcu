@@ -42,6 +42,7 @@ class Run {
     void _setMotor(int pin1, int pin2, int motorIndex, int expect,
                    double correction);
     bool _updateHeading(int angle, float elapsedSeconds);
+    MotionResult _rotate(int direction, int speed, float elapsedSeconds);
     MotionResult _turn(int direction, int speed, int angle,
                        float elapsedSeconds);
 
@@ -57,11 +58,16 @@ class Run {
     void Stop();
     MotionResult Forward(int speed, float elapsedSeconds);
     MotionResult Backward(int speed, float elapsedSeconds);
+    // Continuous manual rotation. Unlike LeftTurn/RightTurn, these methods
+    // have no target angle and run until the caller stops refreshing MOVE.
+    MotionResult RotateLeft(int speed, float elapsedSeconds);
+    MotionResult RotateRight(int speed, float elapsedSeconds);
     MotionResult LeftTurn(int speed, int angle, float elapsedSeconds);
     MotionResult RightTurn(int speed, int angle, float elapsedSeconds);
     MotionResult LeftShift(int speed, float elapsedSeconds);
     MotionResult RightShift(int speed, float elapsedSeconds);
     void setAim(int Aim);
+    void syncAimToCurrentHeading();
     void Getdata();
     int getAim();
     bool imuReady() const;

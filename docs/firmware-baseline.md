@@ -1,6 +1,88 @@
-# ESP32-S3 运动固件可靠停车基线
+# LongPet ESP32-S3 Motion Controller 固件基线
 
-日期：2026-09-09
+日期：2026-09-11
+
+> 2026-09-11 更新：本仓库已切换到 Motion Protocol V2。下方第 3、4、6、7
+> 节保留为原始基线的历史记录，若与本节冲突，以本节和
+> [`motion-protocol-v2.md`](motion-protocol-v2.md) 为准。
+
+## 当前 V2 基线
+
+### 控制模式与数据流
+
+固件当前是 LongPet ESP32-S3 Motion Controller，执行头部 Servo、四轮麦轮、
+编码器 PID、MPU6050 航向保持和 UART 命令。`ControlMode` 为：
+
+| 模式 | 当前行为 |
+|---|---|
+| `SAFE` | 默认模式；四轮停止，目标和 MOVE 不会驱动执行器，头部不自动移动 |
+| `HEAD_ONLY` | 合法 `TARGET` 只按 `dx` 调整头部；底盘执行路径硬阻断 |
+| `MANUAL` | `HEAD` 与新鲜 `MOVE` 独立工作；MOVE 是 500 ms lease |
+| `FOLLOW` | 接收 `TARGET` 并可调整头部；Tinyissimo V1.2 bbox 距离阈值未标定，底盘跟随关闭 |
+
+实际控制链为：
+
+```text
+Serial1 bounded byte poll
+  -> strict V2 line parser / legacy target parser
+  -> mode legality + command freshness timestamps
+  -> recoverable stop or latched fault state
+  -> MANUAL-only chassis dispatch
+  -> Run::Forward/Backward/LeftShift/RightShift/RotateLeft/RotateRight
+  -> encoder PID + heading PID + LEDC channels 4..7 + TB6612 STBY
+```
+
+### Stop 与 Fault
+
+以下是可恢复停车，不设置 `faultLatched`：
+
+- `POWER_ON`
+- `STOP_COMMAND`
+- `TARGET_LOST`
+- `LINK_TIMEOUT`
+- `MODE_CHANGED`
+- `MANUAL_COMMAND_TIMEOUT`
+- `TARGET_TRACKING_ONLY` / `FOLLOW_CHASSIS_DISABLED`
+
+以下继续锁存，必须 ESP reset 或 power cycle：
+
+- `IMU_INIT_FAILED`
+- `IMU_RUNTIME_FAILED`
+- `CONTROL_OVERRUN`
+- `TURN_TIMEOUT`
+
+所有停车均调用 `Run::Stop()`，清零真实电机 LEDC 4、5、6、7，拉低两个 STBY，
+清方向脚、编码器窗口、PID transient state 和连续旋转状态。连续旋转停止前
+会执行 `syncAimToCurrentHeading()`，使后续 Forward/Backward/Shift 维持旋转后
+的新航向，而不是回到旋转前的 aim。Servo 位置不因 STOP 自动回中。
+
+### 三个独立时间戳
+
+`lastValidLinkCommandMs` 可由任一完整且当前模式合法的命令（包括 `PING`）刷新；
+`lastManualMotionCommandMs` 只由 MANUAL `MOVE` 刷新；`lastTargetCommandMs` 只由
+HEAD_ONLY/FOLLOW `TARGET` 刷新。三者默认均为 500 ms。PING 不能续 MANUAL MOVE
+或 TARGET lease。普通网络/UART 抖动因此只触发 recoverable stop，不会永久锁死。
+
+### HEAD_ONLY 与 FOLLOW 安全边界
+
+旧的“舵机到极限后自动 LeftTurn/RightTurn 90°”已从目标处理路径移除。目标
+Servo 修正使用 10 像素 deadband、最大单帧 40 us correction，并始终 clamp 到
+870..2270 us；`TARGET area` 不再触发任何底盘动作。旧 5000/10000 area 常量仅
+保留供未来重新标定，当前 FOLLOW 不使用。
+
+### MANUAL 与连续旋转
+
+`MOVE FORWARD/BACKWARD/SHIFT_LEFT/SHIFT_RIGHT` 沿用原有四轮映射和 encoder PID。
+新增 `Run::RotateLeft/RotateRight`，使用原地旋转轮向，不带目标角度，不调用
+隐含 90°停止条件。只要 MOVE 每 100..200 ms 刷新就持续旋转；STOP、MANUAL
+command timeout、LINK timeout 或模式切换立即停车。`HEAD LEFT/RIGHT/CENTER` 是
+独立位置命令，允许与底盘 MOVE 同时工作。
+
+### 协议与兼容
+
+V2 命令完整定义见 `docs/motion-protocol-v2.md`。保留的旧行 `dx dy area` 仅按
+`TARGET dx dy area` 解释，必须在 HEAD_ONLY/FOLLOW 使用，不能自动 Forward 或
+自动转弯。STATUS 只写 USB debug Serial，不混入 Serial1 控制通道。
 
 ## 1. 验证结论分级
 
@@ -8,10 +90,10 @@
 |---|---|
 | 代码分析 | 已完整阅读原 `xiao_che.ino`、`running.cpp`、`running.h` 并完成安全修改 |
 | 静态核查 | 已检查阻塞接收、LEDC 通道、停止路径、状态转换和两个应用仓库边界 |
-| 编译验证 | 未执行。用户后续明确要求“不用下库、编译” |
+| 编译验证 | `BUILD_NOT_VERIFIED`：本机未发现 Arduino CLI、PlatformIO 或已安装 ESP32 core/toolchain |
 | 硬件实测 | 未执行。未烧录、未打开运动串口、未运行电机命令 |
 
-编译未执行不代表固件已经通过编译；静态分析通过也不代表硬件方向、停车时间、IMU 符号或 PWM 资源已经验证。
+`BUILD_NOT_VERIFIED` 不代表固件已经通过编译；静态分析通过也不代表硬件方向、停车时间、IMU 符号或 PWM 资源已经验证。
 
 ## 2. 原始输入与隔离边界
 
@@ -30,7 +112,7 @@
 
 没有导入两个参考压缩包中的源码，也没有加入 OpenCV、yalantinglibs 或龙芯 GPIO/PWM 库。
 
-## 3. 修改前调用链与问题
+## 3. 历史：修改前调用链与问题（已被 V2 替代）
 
 ```text
 setup
@@ -52,7 +134,7 @@ loop
 
 原目标判断整体位于 `dx != 0` 内，所以 `dx == 0 && area > 0` 不会执行远近判断；`area` 被命名为 `distance`，但实际只是轮廓像素面积。阻塞式 `readBytesUntil()`、宽松 `sscanf()` 和没有链路超时会让半包、额外字段及断联行为不可控。
 
-## 4. 修改后调用链
+## 4. 历史：修改后旧基线调用链（已被 V2 替代）
 
 ```text
 setup
@@ -100,11 +182,13 @@ loop（无阻塞）
 
 ### 舵机 PWM 未决项
 
-用户指定 `Servo 1.3.0`，但本机原先没有 Arduino 环境；按用户后续要求没有继续下载或编译，提供的 `yalantinglibs.zip` 中也未找到 Servo/ESP32Servo 条目。因此本轮无法记录“实际加载的 Servo 库路径”，也不能确认它是否会申请 LEDC 4～7。
+用户指定 `Servo 1.3.0`，但本轮检查到本机没有可用的 Arduino CLI/IDE、ESP32
+core 或库包；提供的 `yalantinglibs.zip` 中也未找到 Servo/ESP32Servo 条目。因此
+本轮无法记录“实际加载的 Servo 库路径”，也不能确认它是否会申请 LEDC 4～7。
 
 首次编译必须打开详细输出，记录 `Multiple libraries were found for Servo.h`/`Used:` 路径，并检查该实现的通道分配源码。未确认前，不能把“代码将电机设为 4～7”当作舵机一定不冲突的证据。
 
-## 6. 串口接线与语义
+## 6. 历史：V1 串口接线与语义（协议部分已被 V2 替代）
 
 | 龙芯 40-pin 物理脚 | 方向 | ESP32-S3 |
 |---|---|---|
@@ -114,7 +198,7 @@ loop（无阻塞）
 
 物理排针号不是 GPIO 号。Linux UART 节点尚未核实，不能默认 `/dev/ttyS2`；COM9 是此前维护龙芯的电脑串口，也不能默认用于 MCU。
 
-`Serial` 只输出调试信息；`Serial1` 只接收龙芯的运动目标。协议仍为：
+`Serial` 只输出调试信息；`Serial1` 只接收龙芯的 V2 命令。历史 V1 行为是：
 
 ```text
 dx dy area\r\n
@@ -128,7 +212,7 @@ dx dy area\r\n
 - 每次 `loop()` 最多消费 32 字节，支持半包、CRLF、多行积压；
 - 只有完整合法行刷新链路时间。空行、半包和错误行都不刷新。
 
-## 7. 目标与状态转换
+## 7. 历史：V1 目标与状态转换（已被 V2 替代）
 
 | 输入/事件 | 行为 | 是否锁存 |
 |---|---|---|
@@ -174,7 +258,7 @@ STBY 低仅表示撤销驱动/高阻滑行。代码检测到故障至 STBY 变�
 - ESP32Encoder 0.12.0；PID 1.2.0；Servo 1.3.0；DHT sensor library 1.4.7；
 - Core 自带 Wire 2.0.0、SPI 2.0.0。
 
-本轮未执行编译，所以没有固件产物。以下 Arduino 板卡选项尚缺，不能自行猜测：
+本机已检查常见工具入口和 `C:\Users\18214\AppData\Local\Arduino15` 缓存，但未发现 Arduino CLI、PlatformIO、Arduino IDE、ESP32 core 或编译器包，因此本轮结果为 `BUILD_NOT_VERIFIED`，没有固件产物。以下 Arduino 板卡选项也尚缺，不能自行猜测：
 
 - CPU Frequency；
 - Flash Mode、Flash Size、Partition Scheme；
@@ -195,6 +279,6 @@ STBY 低仅表示撤销驱动/高阻滑行。代码检测到故障至 STBY 变�
 - 软件超时不能处理 MCU 死机、TB6612/STBY 线路短路或电源级故障。需要外部 STBY 下拉、保险/限流和可触达硬件急停。
 - 复位到 `BeginSafe()` 执行前 GPIO 可能高阻，单靠软件不能保证这段上电窗口；必须用硬件下拉保证默认禁用。
 
-## 11. 下一步接入建议（未实现）
+## 11. 下一步接入建议（V2 后续工作）
 
-先用设备树 aliases、`dmesg` 和 `/sys/class/tty` 核实龙芯 UART2 的真实 Linux 节点，再在 LongPet 中按现有分层加入 `MotionService -> SerialMotionAdapter`。页面不得直接打开串口。第一版仍只发送三个整数，并由 Adapter 以固定周期写入最新视觉结果；不要在确认本基线台架通过前加入远程速度或家属端 API。
+先用设备树 aliases、`dmesg` 和 `/sys/class/tty` 核实龙芯 UART2 的真实 Linux 节点，再在 LongPet 中按现有分层加入 `MotionService -> SerialMotionAdapter`。页面不得直接打开串口。Vision Adapter 在 `HEAD_ONLY` 下发送 `TARGET dx dy area`；家属端在 `MANUAL` 下按 100..200 ms 周期刷新 `MOVE`，按钮释放发送 `STOP`。不要在确认本基线台架通过前接入未经验证的远程速度策略。FOLLOW 必须先完成 Tinyissimo V1.2 bbox area/distance 重新标定，再单独设计和验证自动底盘策略。

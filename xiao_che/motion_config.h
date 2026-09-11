@@ -10,6 +10,10 @@ constexpr uint32_t kLinkBaud = 115200;
 constexpr uint32_t kControlPeriodMs = 100;
 constexpr uint32_t kControlOverrunMs = 250;
 constexpr uint32_t kLinkTimeoutMs = 500;
+// These timeouts intentionally have separate names and timestamps in the
+// sketch. A PING can refresh the link timeout, but never a motion lease.
+constexpr uint32_t kManualCommandTimeoutMs = 500;
+constexpr uint32_t kTargetTimeoutMs = 500;
 constexpr uint32_t kTurnTimeoutMs = 3000;
 constexpr uint32_t kDiagnosticRepeatMs = 2000;
 constexpr uint32_t kDhtSamplePeriodMs = 3000;
@@ -25,8 +29,16 @@ constexpr int32_t kMaxDyPixels = 4096;
 constexpr int32_t kMinAreaPixels = 0;
 constexpr int32_t kMaxAreaPixels = 16777216;
 
-constexpr int32_t kHorizontalDeadbandPixels = 10;
-// Temporary pixel-area thresholds; both depend on detector resolution.
+// Target-to-head control is deliberately conservative: a target update can
+// move the servo only a bounded amount, and small errors are ignored.
+constexpr int32_t kHeadTargetDeadbandPixels = 10;
+constexpr int32_t kHeadTargetCorrectionDivisor = 8;
+constexpr int kHeadDefaultStepUs = 20;
+constexpr int kHeadMaximumStepUs = 100;
+constexpr int kHeadMaximumCorrectionPerTargetUs = 40;
+
+// Temporary pixel-area thresholds retained for future FOLLOW calibration.
+// They must not drive the chassis in the current firmware.
 constexpr int32_t kFarAreaExclusive = 5000;
 constexpr int32_t kNearAreaExclusive = 10000;
 
@@ -58,6 +70,12 @@ static_assert(kFarAreaExclusive < kNearAreaExclusive,
               "far threshold must be below near threshold");
 static_assert(kLinkTimeoutMs > kControlPeriodMs,
               "link timeout must allow at least one control period");
+static_assert(kManualCommandTimeoutMs > kControlPeriodMs,
+              "manual timeout must allow at least one control period");
+static_assert(kTargetTimeoutMs > kControlPeriodMs,
+              "target timeout must allow at least one control period");
+static_assert(kHeadMaximumStepUs >= kHeadDefaultStepUs,
+              "maximum head step must cover the default step");
 
 }  // namespace MotionConfig
 

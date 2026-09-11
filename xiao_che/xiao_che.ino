@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "motion_config.h"
 #include "running.h"
@@ -43,23 +44,34 @@ constexpr int LINK_RX = 6;
 constexpr int LINK_TX = 7;
 }
 
+enum class ControlMode : uint8_t {
+    Safe,
+    HeadOnly,
+    Manual,
+    Follow
+};
+
 enum class MotionMode : uint8_t {
     Stopped,
     Forward,
     Backward,
-    LeftTurn,
-    RightTurn,
+    RotateLeft,
+    RotateRight,
     LeftShift,
-    RightShift
+    RightShift,
+    LeftTurn,
+    RightTurn
 };
 
 enum class StopReason : uint8_t {
     PowerOn,
-    AligningTarget,
-    AreaHold,
-    TargetNear,
+    StopCommand,
     TargetLost,
     LinkTimeout,
+    ModeChanged,
+    ManualCommandTimeout,
+    TargetTrackingOnly,
+    FollowChassisDisabled,
     ImuInitFailed,
     ImuRuntimeFailed,
     TurnTimeout,
@@ -80,12 +92,15 @@ Run car(Pins::AIN1, Pins::AIN2, Pins::BIN1, Pins::BIN2,
 DHT dht(Pins::DHT_PIN, DHT22);
 Servo trackingServo;
 
+ControlMode controlMode = ControlMode::Safe;
 MotionMode motionMode = MotionMode::Stopped;
 StopReason stopReason = StopReason::PowerOn;
 bool targetAvailable = false;
-bool haveValidFrame = false;
 bool faultLatched = false;
 int servoPulseUs = MotionConfig::kServoCenterUs;
+TargetFrame currentTarget;
+int manualMotionSpeed = 0;
+bool manualMotionActive = false;
 
 char serialLine[MotionConfig::kSerialLineCapacity] = {};
 size_t serialLineLength = 0;
@@ -93,27 +108,45 @@ bool discardUntilNewline = false;
 uint32_t malformedLineCount = 0;
 uint32_t discardedLineCount = 0;
 
-uint32_t lastValidFrameMs = 0;
+bool haveValidLinkCommand = false;
+bool linkTimedOut = false;
+uint32_t lastValidLinkCommandMs = 0;
+uint32_t lastManualMotionCommandMs = 0;
+uint32_t lastTargetCommandMs = 0;
 uint32_t lastControlMs = 0;
 uint32_t turnStartedMs = 0;
 uint32_t lastDhtSampleMs = 0;
 uint32_t lastSerialDiagnosticMs = 0;
+uint32_t lastHeadLogMs = 0;
 
 const char* stopReasonName(StopReason reason);
+const char* controlModeName(ControlMode mode);
 const char* motionModeName(MotionMode mode);
 bool elapsedAtLeast(uint32_t now, uint32_t then, uint32_t interval);
 void setStopped(StopReason reason);
 void latchFault(StopReason reason);
-void enterMotion(MotionMode mode, uint32_t now);
-bool parseInteger(const char*& cursor, int32_t& value);
-bool parseTargetLine(const char* line, TargetFrame& frame);
+void changeControlMode(ControlMode mode);
+bool startManualMotion(MotionMode mode, int speed, uint32_t now);
+bool parseIntegerToken(const char* token, int32_t& value);
+bool nextToken(const char*& cursor, char* token, size_t tokenCapacity);
+bool noMoreTokens(const char* cursor);
+bool parseTargetTokens(const char*& cursor, TargetFrame& frame);
+bool parseLegacyTargetLine(const char* line, TargetFrame& frame);
+bool parseModeToken(const char* token, ControlMode& mode);
+bool parseSpeedToken(const char* token, int& speed);
+bool parseHeadStepToken(const char* token, int& step);
+void updateHeadFromTarget(int32_t dx, uint32_t now);
+bool handleHeadCommand(const char* action, int step, uint32_t now);
 void handleValidTarget(const TargetFrame& frame, uint32_t now);
+bool handleCommandLine(const char* line, uint32_t now);
+void markValidLinkCommand(uint32_t now);
 void finishSerialLine(uint32_t now);
 void pollLinkSerial(uint32_t now);
 void reportSerialDiagnostics(uint32_t now);
-void checkLinkTimeout(uint32_t now);
+void checkMotionTimeouts(uint32_t now);
 void runControlCycle(uint32_t now);
 void sampleDhtWhenStopped(uint32_t now);
+void reportStatus();
 
 void setup() {
     // This is intentionally the first hardware operation.
@@ -147,13 +180,14 @@ void setup() {
     lastControlMs = now;
     lastDhtSampleMs = now;
     lastSerialDiagnosticMs = now;
-    Serial.println("[BOOT] READY manual_reset_clears_faults=1");
+    Serial.println("[MODE] SAFE");
+    Serial.println("[BOOT] READY protocol=V2 fault_reset=1");
 }
 
 void loop() {
     const uint32_t now = millis();
     pollLinkSerial(now);
-    checkLinkTimeout(now);
+    checkMotionTimeouts(now);
     runControlCycle(now);
     reportSerialDiagnostics(now);
     sampleDhtWhenStopped(now);
@@ -162,11 +196,13 @@ void loop() {
 const char* stopReasonName(StopReason reason) {
     switch (reason) {
     case StopReason::PowerOn: return "POWER_ON";
-    case StopReason::AligningTarget: return "ALIGNING_TARGET";
-    case StopReason::AreaHold: return "AREA_HOLD";
-    case StopReason::TargetNear: return "TARGET_NEAR";
+    case StopReason::StopCommand: return "STOP_COMMAND";
     case StopReason::TargetLost: return "TARGET_LOST";
     case StopReason::LinkTimeout: return "LINK_TIMEOUT";
+    case StopReason::ModeChanged: return "MODE_CHANGED";
+    case StopReason::ManualCommandTimeout: return "MANUAL_COMMAND_TIMEOUT";
+    case StopReason::TargetTrackingOnly: return "TARGET_TRACKING_ONLY";
+    case StopReason::FollowChassisDisabled: return "FOLLOW_CHASSIS_DISABLED";
     case StopReason::ImuInitFailed: return "IMU_INIT_FAILED";
     case StopReason::ImuRuntimeFailed: return "IMU_RUNTIME_FAILED";
     case StopReason::TurnTimeout: return "TURN_TIMEOUT";
@@ -176,15 +212,27 @@ const char* stopReasonName(StopReason reason) {
     return "UNKNOWN";
 }
 
+const char* controlModeName(ControlMode mode) {
+    switch (mode) {
+    case ControlMode::Safe: return "SAFE";
+    case ControlMode::HeadOnly: return "HEAD_ONLY";
+    case ControlMode::Manual: return "MANUAL";
+    case ControlMode::Follow: return "FOLLOW";
+    }
+    return "UNKNOWN";
+}
+
 const char* motionModeName(MotionMode mode) {
     switch (mode) {
     case MotionMode::Stopped: return "STOPPED";
     case MotionMode::Forward: return "FORWARD";
     case MotionMode::Backward: return "BACKWARD";
+    case MotionMode::RotateLeft: return "ROTATE_LEFT";
+    case MotionMode::RotateRight: return "ROTATE_RIGHT";
+    case MotionMode::LeftShift: return "SHIFT_LEFT";
+    case MotionMode::RightShift: return "SHIFT_RIGHT";
     case MotionMode::LeftTurn: return "LEFT_TURN";
     case MotionMode::RightTurn: return "RIGHT_TURN";
-    case MotionMode::LeftShift: return "LEFT_SHIFT";
-    case MotionMode::RightShift: return "RIGHT_SHIFT";
     }
     return "UNKNOWN";
 }
@@ -195,67 +243,132 @@ bool elapsedAtLeast(uint32_t now, uint32_t then, uint32_t interval) {
 
 void setStopped(StopReason reason) {
     const bool changed = motionMode != MotionMode::Stopped || stopReason != reason;
+    const bool wasContinuousRotation =
+        motionMode == MotionMode::RotateLeft
+        || motionMode == MotionMode::RotateRight;
     motionMode = MotionMode::Stopped;
     stopReason = reason;
+    manualMotionActive = false;
+    manualMotionSpeed = 0;
+    lastManualMotionCommandMs = 0;
+    turnStartedMs = 0;
+    if (wasContinuousRotation) {
+        car.syncAimToCurrentHeading();
+    }
     car.Stop();
     if (changed) {
         Serial.printf("[STOP] %s latched=%d\n",
                       stopReasonName(reason), faultLatched ? 1 : 0);
+        if (reason == StopReason::TargetLost) {
+            Serial.println("[TARGET] LOST");
+        }
     }
 }
 
 void latchFault(StopReason reason) {
+    const bool firstFault = !faultLatched;
     faultLatched = true;
     targetAvailable = false;
+    if (firstFault) {
+        Serial.printf("[FAULT] %s\n", stopReasonName(reason));
+    }
     setStopped(reason);
 }
 
-void enterMotion(MotionMode mode, uint32_t now) {
-    if (faultLatched || !targetAvailable || mode == MotionMode::Stopped) {
+void changeControlMode(ControlMode mode) {
+    if (controlMode == mode) {
         return;
     }
-    if (motionMode == mode) {
-        return;
-    }
-    car.Stop();
-    motionMode = mode;
-    if (mode == MotionMode::LeftTurn || mode == MotionMode::RightTurn) {
-        turnStartedMs = now;
-    }
-    Serial.printf("[MOTION] %s\n", motionModeName(mode));
+
+    // A mode transition is a hard chassis boundary. Clear every transient
+    // lease/target before exposing the new mode to the control cycle.
+    setStopped(StopReason::ModeChanged);
+    targetAvailable = false;
+    currentTarget = TargetFrame{};
+    lastManualMotionCommandMs = 0;
+    lastTargetCommandMs = 0;
+    manualMotionActive = false;
+    manualMotionSpeed = 0;
+    controlMode = mode;
+    Serial.printf("[MODE] %s\n", controlModeName(controlMode));
 }
 
-bool parseInteger(const char*& cursor, int32_t& value) {
-    while (*cursor != '\0' && isspace(static_cast<unsigned char>(*cursor))) {
-        ++cursor;
+bool startManualMotion(MotionMode mode, int speed, uint32_t now) {
+    if (faultLatched || controlMode != ControlMode::Manual
+        || mode == MotionMode::Stopped) {
+        return false;
     }
-    if (*cursor == '\0') {
+
+    const bool commandChanged = motionMode != mode || manualMotionSpeed != speed;
+    if (commandChanged) {
+        const bool wasContinuousRotation =
+            motionMode == MotionMode::RotateLeft
+            || motionMode == MotionMode::RotateRight;
+        if (wasContinuousRotation) {
+            car.syncAimToCurrentHeading();
+        }
+        car.Stop();
+        motionMode = mode;
+        Serial.printf("[MOTION] %s speed=%d\n",
+                      motionModeName(mode), speed);
+    }
+    manualMotionSpeed = speed;
+    manualMotionActive = true;
+    lastManualMotionCommandMs = now;
+    return true;
+}
+
+bool parseIntegerToken(const char* token, int32_t& value) {
+    if (token == nullptr || *token == '\0') {
         return false;
     }
 
     errno = 0;
     char* end = nullptr;
-    const long parsed = strtol(cursor, &end, 10);
-    if (end == cursor || errno == ERANGE || parsed < INT32_MIN
-        || parsed > INT32_MAX) {
+    const long parsed = strtol(token, &end, 10);
+    if (end == token || *end != '\0' || errno == ERANGE
+        || parsed < INT32_MIN || parsed > INT32_MAX) {
         return false;
     }
-    cursor = end;
     value = static_cast<int32_t>(parsed);
     return true;
 }
 
-bool parseTargetLine(const char* line, TargetFrame& frame) {
-    const char* cursor = line;
-    if (!parseInteger(cursor, frame.dx)
-        || !parseInteger(cursor, frame.dy)
-        || !parseInteger(cursor, frame.area)) {
-        return false;
-    }
-    while (*cursor != '\0' && isspace(static_cast<unsigned char>(*cursor))) {
+bool nextToken(const char*& cursor, char* token, size_t tokenCapacity) {
+    while (*cursor == ' ') {
         ++cursor;
     }
-    if (*cursor != '\0') {
+    if (*cursor == '\0' || tokenCapacity == 0) {
+        return false;
+    }
+
+    size_t length = 0;
+    while (*cursor != '\0' && *cursor != ' ') {
+        if (length + 1 >= tokenCapacity) {
+            return false;
+        }
+        token[length++] = *cursor++;
+    }
+    token[length] = '\0';
+    return true;
+}
+
+bool noMoreTokens(const char* cursor) {
+    while (*cursor == ' ') {
+        ++cursor;
+    }
+    return *cursor == '\0';
+}
+
+bool parseTargetTokens(const char*& cursor, TargetFrame& frame) {
+    char token[20] = {};
+    if (!nextToken(cursor, token, sizeof(token))
+        || !parseIntegerToken(token, frame.dx)
+        || !nextToken(cursor, token, sizeof(token))
+        || !parseIntegerToken(token, frame.dy)
+        || !nextToken(cursor, token, sizeof(token))
+        || !parseIntegerToken(token, frame.area)
+        || !noMoreTokens(cursor)) {
         return false;
     }
     return frame.dx >= MotionConfig::kMinDxPixels
@@ -266,13 +379,111 @@ bool parseTargetLine(const char* line, TargetFrame& frame) {
         && frame.area <= MotionConfig::kMaxAreaPixels;
 }
 
-void handleValidTarget(const TargetFrame& frame, uint32_t now) {
-    haveValidFrame = true;
-    lastValidFrameMs = now;
+bool parseLegacyTargetLine(const char* line, TargetFrame& frame) {
+    const char* cursor = line;
+    return parseTargetTokens(cursor, frame);
+}
 
-    if (faultLatched) {
+bool parseModeToken(const char* token, ControlMode& mode) {
+    if (strcmp(token, "SAFE") == 0) {
+        mode = ControlMode::Safe;
+    } else if (strcmp(token, "HEAD_ONLY") == 0) {
+        mode = ControlMode::HeadOnly;
+    } else if (strcmp(token, "MANUAL") == 0) {
+        mode = ControlMode::Manual;
+    } else if (strcmp(token, "FOLLOW") == 0) {
+        mode = ControlMode::Follow;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool parseSpeedToken(const char* token, int& speed) {
+    int32_t parsed = 0;
+    if (!parseIntegerToken(token, parsed)
+        || parsed < 1 || parsed > MotionConfig::kMaximumSpeedCommand) {
+        return false;
+    }
+    speed = static_cast<int>(parsed);
+    return true;
+}
+
+bool parseHeadStepToken(const char* token, int& step) {
+    int32_t parsed = 0;
+    if (!parseIntegerToken(token, parsed)
+        || parsed < 1 || parsed > MotionConfig::kHeadMaximumStepUs) {
+        return false;
+    }
+    step = static_cast<int>(parsed);
+    return true;
+}
+
+void updateHeadFromTarget(int32_t dx, uint32_t now) {
+    const int64_t magnitude = dx < 0
+        ? -static_cast<int64_t>(dx)
+        : static_cast<int64_t>(dx);
+    if (magnitude <= MotionConfig::kHeadTargetDeadbandPixels) {
         return;
     }
+
+    const int64_t excess = magnitude - MotionConfig::kHeadTargetDeadbandPixels;
+    int correction = 1 + static_cast<int>(
+        excess / MotionConfig::kHeadTargetCorrectionDivisor);
+    correction = constrain(correction, 1,
+                           MotionConfig::kHeadMaximumCorrectionPerTargetUs);
+
+    const int64_t signedCorrection = dx > 0 ? correction : -correction;
+    const int64_t requested = static_cast<int64_t>(servoPulseUs)
+        - signedCorrection;
+    const int bounded = constrain(static_cast<int>(requested),
+                                  MotionConfig::kServoMinimumUs,
+                                  MotionConfig::kServoMaximumUs);
+    if (bounded == servoPulseUs) {
+        return;
+    }
+
+    servoPulseUs = bounded;
+    trackingServo.writeMicroseconds(servoPulseUs);
+    if (lastHeadLogMs == 0
+        || elapsedAtLeast(now, lastHeadLogMs,
+                          MotionConfig::kDiagnosticRepeatMs)) {
+        Serial.printf("[HEAD] TARGET pulse=%d\n", servoPulseUs);
+        lastHeadLogMs = now;
+    }
+}
+
+bool handleHeadCommand(const char* action, int step, uint32_t now) {
+    if (faultLatched || controlMode != ControlMode::Manual) {
+        return false;
+    }
+
+    int requested = servoPulseUs;
+    if (strcmp(action, "LEFT") == 0) {
+        requested -= step;
+    } else if (strcmp(action, "RIGHT") == 0) {
+        requested += step;
+    } else if (strcmp(action, "CENTER") == 0) {
+        requested = MotionConfig::kServoCenterUs;
+    } else {
+        return false;
+    }
+
+    servoPulseUs = constrain(requested, MotionConfig::kServoMinimumUs,
+                             MotionConfig::kServoMaximumUs);
+    trackingServo.writeMicroseconds(servoPulseUs);
+    if (lastHeadLogMs == 0
+        || elapsedAtLeast(now, lastHeadLogMs,
+                          MotionConfig::kDiagnosticRepeatMs)) {
+        Serial.printf("[HEAD] %s pulse=%d\n", action, servoPulseUs);
+        lastHeadLogMs = now;
+    }
+    return true;
+}
+
+void handleValidTarget(const TargetFrame& frame, uint32_t now) {
+    lastTargetCommandMs = now;
+    currentTarget = frame;
     if (frame.area == 0) {
         targetAvailable = false;
         setStopped(StopReason::TargetLost);
@@ -280,47 +491,152 @@ void handleValidTarget(const TargetFrame& frame, uint32_t now) {
     }
 
     targetAvailable = true;
-    if (frame.dx != 0) {
-        const int64_t corrected = static_cast<int64_t>(servoPulseUs) - frame.dx;
-        if (corrected < MotionConfig::kServoMinimumUs) {
-            servoPulseUs = MotionConfig::kServoMinimumUs;
-        } else if (corrected > MotionConfig::kServoMaximumUs) {
-            servoPulseUs = MotionConfig::kServoMaximumUs;
+    updateHeadFromTarget(frame.dx, now);
+
+    // FOLLOW chassis control is intentionally disabled until the bbox area
+    // thresholds are calibrated. Neither mode has an implicit wheel path.
+    setStopped(controlMode == ControlMode::Follow
+                   ? StopReason::FollowChassisDisabled
+                   : StopReason::TargetTrackingOnly);
+}
+
+void markValidLinkCommand(uint32_t now) {
+    if (linkTimedOut) {
+        linkTimedOut = false;
+        Serial.println("[RECOVER] LINK_RESTORED");
+    }
+    haveValidLinkCommand = true;
+    lastValidLinkCommandMs = now;
+}
+
+void reportStatus() {
+    Serial.printf("[STATUS] mode=%s motion=%s stop=%s fault=%d target=%d "
+                  "servo=%d imu=%d\n",
+                  controlModeName(controlMode), motionModeName(motionMode),
+                  stopReasonName(stopReason), faultLatched ? 1 : 0,
+                  targetAvailable ? 1 : 0, servoPulseUs,
+                  car.imuReady() ? 1 : 0);
+}
+
+bool handleCommandLine(const char* line, uint32_t now) {
+    char command[20] = {};
+    const char* cursor = line;
+    if (!nextToken(cursor, command, sizeof(command))) {
+        return false;
+    }
+
+    if (strcmp(command, "PING") == 0) {
+        return noMoreTokens(cursor);
+    }
+    if (strcmp(command, "STATUS") == 0) {
+        if (!noMoreTokens(cursor)) {
+            return false;
+        }
+        reportStatus();
+        return true;
+    }
+    if (strcmp(command, "STOP") == 0) {
+        if (!noMoreTokens(cursor)) {
+            return false;
+        }
+        setStopped(StopReason::StopCommand);
+        return true;
+    }
+    if (strcmp(command, "MODE") == 0) {
+        char modeToken[20] = {};
+        ControlMode requestedMode = ControlMode::Safe;
+        if (!nextToken(cursor, modeToken, sizeof(modeToken))
+            || !parseModeToken(modeToken, requestedMode)
+            || !noMoreTokens(cursor)) {
+            return false;
+        }
+        changeControlMode(requestedMode);
+        return true;
+    }
+    if (strcmp(command, "TARGET") == 0) {
+        if (faultLatched
+            || (controlMode != ControlMode::HeadOnly
+                && controlMode != ControlMode::Follow)) {
+            return false;
+        }
+        TargetFrame frame;
+        if (!parseTargetTokens(cursor, frame)) {
+            return false;
+        }
+        handleValidTarget(frame, now);
+        return true;
+    }
+    if (strcmp(command, "HEAD") == 0) {
+        if (faultLatched || controlMode != ControlMode::Manual) {
+            return false;
+        }
+        char action[20] = {};
+        if (!nextToken(cursor, action, sizeof(action))) {
+            return false;
+        }
+        if (strcmp(action, "CENTER") == 0) {
+            return noMoreTokens(cursor) && handleHeadCommand(action, 0, now);
+        }
+        if (strcmp(action, "LEFT") != 0 && strcmp(action, "RIGHT") != 0) {
+            return false;
+        }
+        int step = MotionConfig::kHeadDefaultStepUs;
+        char stepToken[20] = {};
+        if (!noMoreTokens(cursor)) {
+            if (!nextToken(cursor, stepToken, sizeof(stepToken))
+                || !parseHeadStepToken(stepToken, step)
+                || !noMoreTokens(cursor)) {
+                return false;
+            }
+        }
+        return handleHeadCommand(action, step, now);
+    }
+    if (strcmp(command, "MOVE") == 0) {
+        if (faultLatched || controlMode != ControlMode::Manual) {
+            return false;
+        }
+        char direction[20] = {};
+        char speedToken[20] = {};
+        int speed = 0;
+        if (!nextToken(cursor, direction, sizeof(direction))
+            || !nextToken(cursor, speedToken, sizeof(speedToken))
+            || !noMoreTokens(cursor)
+            || !parseSpeedToken(speedToken, speed)) {
+            return false;
+        }
+
+        MotionMode requestedMotion = MotionMode::Stopped;
+        if (strcmp(direction, "FORWARD") == 0) {
+            requestedMotion = MotionMode::Forward;
+        } else if (strcmp(direction, "BACKWARD") == 0) {
+            requestedMotion = MotionMode::Backward;
+        } else if (strcmp(direction, "ROTATE_LEFT") == 0) {
+            requestedMotion = MotionMode::RotateLeft;
+        } else if (strcmp(direction, "ROTATE_RIGHT") == 0) {
+            requestedMotion = MotionMode::RotateRight;
+        } else if (strcmp(direction, "SHIFT_LEFT") == 0) {
+            requestedMotion = MotionMode::LeftShift;
+        } else if (strcmp(direction, "SHIFT_RIGHT") == 0) {
+            requestedMotion = MotionMode::RightShift;
         } else {
-            servoPulseUs = static_cast<int>(corrected);
+            return false;
         }
-        trackingServo.writeMicroseconds(servoPulseUs);
+        return startManualMotion(requestedMotion, speed, now);
     }
 
-    // A running turn owns the chassis until completion, timeout, or safety stop.
-    if (motionMode == MotionMode::LeftTurn
-        || motionMode == MotionMode::RightTurn) {
-        return;
+    // Legacy `dx dy area` is syntax compatibility only. It follows TARGET
+    // mode rules and never restores the old automatic chassis behavior.
+    if (faultLatched
+        || (controlMode != ControlMode::HeadOnly
+            && controlMode != ControlMode::Follow)) {
+        return false;
     }
-
-    const bool horizontallyCentered =
-        abs(frame.dx) < MotionConfig::kHorizontalDeadbandPixels;
-    if (!horizontallyCentered) {
-        setStopped(StopReason::AligningTarget);
-        if (servoPulseUs == MotionConfig::kServoMaximumUs) {
-            // Preserve original mapping: upper servo limit selects LeftTurn.
-            enterMotion(MotionMode::LeftTurn, now);
-        } else if (servoPulseUs == MotionConfig::kServoMinimumUs) {
-            // Preserve original mapping: lower servo limit selects RightTurn.
-            enterMotion(MotionMode::RightTurn, now);
-        }
-        return;
+    TargetFrame legacyFrame;
+    if (!parseLegacyTargetLine(line, legacyFrame)) {
+        return false;
     }
-
-    // dx == 0 reaches this branch. dy is accepted but unused by this baseline.
-    if (frame.area < MotionConfig::kFarAreaExclusive) {
-        enterMotion(MotionMode::Forward, now);
-    } else if (frame.area <= MotionConfig::kNearAreaExclusive) {
-        // The complete middle band, including 5000 and 10000, is a safe hold.
-        setStopped(StopReason::AreaHold);
-    } else {
-        setStopped(StopReason::TargetNear);
-    }
+    handleValidTarget(legacyFrame, now);
+    return true;
 }
 
 void finishSerialLine(uint32_t now) {
@@ -335,9 +651,8 @@ void finishSerialLine(uint32_t now) {
     }
 
     serialLine[serialLineLength] = '\0';
-    TargetFrame frame;
-    if (parseTargetLine(serialLine, frame)) {
-        handleValidTarget(frame, now);
+    if (handleCommandLine(serialLine, now)) {
+        markValidLinkCommand(now);
     } else {
         ++malformedLineCount;
     }
@@ -361,7 +676,7 @@ void pollLinkSerial(uint32_t now) {
         if (discardUntilNewline) {
             continue;
         }
-        if ((static_cast<unsigned char>(value) < 0x20 && value != '\t')
+        if (static_cast<unsigned char>(value) < 0x20
             || static_cast<unsigned char>(value) > 0x7e) {
             discardUntilNewline = true;
             serialLineLength = 0;
@@ -391,12 +706,42 @@ void reportSerialDiagnostics(uint32_t now) {
     }
 }
 
-void checkLinkTimeout(uint32_t now) {
-    if (!faultLatched && haveValidFrame
-        && elapsedAtLeast(now, lastValidFrameMs,
-                          MotionConfig::kLinkTimeoutMs)) {
-        latchFault(StopReason::LinkTimeout);
+void checkMotionTimeouts(uint32_t now) {
+    if (faultLatched) {
+        return;
     }
+
+    if ((controlMode == ControlMode::HeadOnly
+         || controlMode == ControlMode::Follow) && targetAvailable
+        && elapsedAtLeast(now, lastTargetCommandMs,
+                          MotionConfig::kTargetTimeoutMs)) {
+        targetAvailable = false;
+        setStopped(StopReason::TargetLost);
+        return;
+    }
+
+    if (motionMode == MotionMode::Stopped) {
+        return;
+    }
+
+    // With no command at all, report the general link failure. If PING keeps
+    // the link alive, the more specific manual lease below still expires.
+    const bool linkExpired = !haveValidLinkCommand
+        || elapsedAtLeast(now, lastValidLinkCommandMs,
+                          MotionConfig::kLinkTimeoutMs);
+    if (linkExpired) {
+        linkTimedOut = true;
+        setStopped(StopReason::LinkTimeout);
+        return;
+    }
+
+    if (controlMode == ControlMode::Manual && manualMotionActive
+        && elapsedAtLeast(now, lastManualMotionCommandMs,
+                          MotionConfig::kManualCommandTimeoutMs)) {
+        setStopped(StopReason::ManualCommandTimeout);
+        return;
+    }
+
 }
 
 void runControlCycle(uint32_t now) {
@@ -406,8 +751,7 @@ void runControlCycle(uint32_t now) {
     }
     lastControlMs = now;
 
-    if (faultLatched || !targetAvailable
-        || motionMode == MotionMode::Stopped) {
+    if (motionMode == MotionMode::Stopped) {
         car.Stop();
         return;
     }
@@ -415,6 +759,23 @@ void runControlCycle(uint32_t now) {
         latchFault(StopReason::ControlOverrun);
         return;
     }
+    if (faultLatched) {
+        car.Stop();
+        return;
+    }
+
+    // The current firmware has no automatic chassis path in SAFE, HEAD_ONLY,
+    // or FOLLOW. Keep this guard next to the actuator dispatch so a stale or
+    // accidentally populated motion state cannot move the wheels there.
+    if (controlMode != ControlMode::Manual || !manualMotionActive) {
+        setStopped(controlMode == ControlMode::Follow
+                       ? StopReason::FollowChassisDisabled
+                       : controlMode == ControlMode::HeadOnly
+                           ? StopReason::TargetTrackingOnly
+                           : StopReason::ModeChanged);
+        return;
+    }
+
     if ((motionMode == MotionMode::LeftTurn
          || motionMode == MotionMode::RightTurn)
         && elapsedAtLeast(now, turnStartedMs,
@@ -430,29 +791,35 @@ void runControlCycle(uint32_t now) {
         car.Stop();
         return;
     case MotionMode::Forward:
-        result = car.Forward(MotionConfig::kTrackingSpeedCommand,
+        result = car.Forward(manualMotionSpeed,
                              elapsedSeconds);
         break;
     case MotionMode::Backward:
-        result = car.Backward(MotionConfig::kTrackingSpeedCommand,
-                              elapsedSeconds);
+        result = car.Backward(manualMotionSpeed,
+                             elapsedSeconds);
+        break;
+    case MotionMode::RotateLeft:
+        result = car.RotateLeft(manualMotionSpeed, elapsedSeconds);
+        break;
+    case MotionMode::RotateRight:
+        result = car.RotateRight(manualMotionSpeed, elapsedSeconds);
         break;
     case MotionMode::LeftTurn:
-        result = car.LeftTurn(MotionConfig::kTurnSpeedCommand,
+        result = car.LeftTurn(manualMotionSpeed,
                               MotionConfig::kTurnAngleDegrees,
                               elapsedSeconds);
         break;
     case MotionMode::RightTurn:
-        result = car.RightTurn(MotionConfig::kTurnSpeedCommand,
+        result = car.RightTurn(manualMotionSpeed,
                                MotionConfig::kTurnAngleDegrees,
                                elapsedSeconds);
         break;
     case MotionMode::LeftShift:
-        result = car.LeftShift(MotionConfig::kTrackingSpeedCommand,
+        result = car.LeftShift(manualMotionSpeed,
                                elapsedSeconds);
         break;
     case MotionMode::RightShift:
-        result = car.RightShift(MotionConfig::kTrackingSpeedCommand,
+        result = car.RightShift(manualMotionSpeed,
                                 elapsedSeconds);
         break;
     }
@@ -460,8 +827,6 @@ void runControlCycle(uint32_t now) {
     if (result == MotionResult::ImuFault) {
         latchFault(StopReason::ImuRuntimeFailed);
     } else if (result == MotionResult::Completed) {
-        // Require a newly received valid frame before another turn can start.
-        targetAvailable = false;
         setStopped(StopReason::TurnCompleted);
     }
 }

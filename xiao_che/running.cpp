@@ -235,6 +235,41 @@ MotionResult Run::Backward(int speed, float elapsedSeconds) {
     return MotionResult::Running;
 }
 
+MotionResult Run::_rotate(int direction, int speed, float elapsedSeconds) {
+    // Keep integrating the IMU while rotating so a later manual translation
+    // can adopt the heading reached by the user. The heading PID is not used
+    // as a stop condition for this command.
+    const int currentHeading = static_cast<int>(std::lround(_input[4]));
+    if (!_updateHeading(currentHeading, elapsedSeconds)) {
+        Stop();
+        return MotionResult::ImuFault;
+    }
+
+    if (direction < 0) {
+        // Preserve the original A/B/C/D wheel map for left rotation.
+        _setMotor(_ain1, _ain2, 0, speed, 0);
+        _setMotor(_bin1, _bin2, 1, -speed, 0);
+        _setMotor(_cin1, _cin2, 2, speed, 0);
+        _setMotor(_din1, _din2, 3, -speed, 0);
+    } else {
+        // Preserve the original A/B/C/D wheel map for right rotation.
+        _setMotor(_ain1, _ain2, 0, -speed, 0);
+        _setMotor(_bin1, _bin2, 1, speed, 0);
+        _setMotor(_cin1, _cin2, 2, -speed, 0);
+        _setMotor(_din1, _din2, 3, speed, 0);
+    }
+    _enableDrivers();
+    return MotionResult::Running;
+}
+
+MotionResult Run::RotateLeft(int speed, float elapsedSeconds) {
+    return _rotate(-1, speed, elapsedSeconds);
+}
+
+MotionResult Run::RotateRight(int speed, float elapsedSeconds) {
+    return _rotate(1, speed, elapsedSeconds);
+}
+
 MotionResult Run::_turn(int direction, int speed, int angle,
                         float elapsedSeconds) {
     if (!_turnActive) {
@@ -314,6 +349,11 @@ MotionResult Run::RightShift(int speed, float elapsedSeconds) {
 
 void Run::setAim(int Aim) {
     aim = Aim;
+}
+
+void Run::syncAimToCurrentHeading() {
+    aim = static_cast<int>(std::lround(_input[4]));
+    _setpoint[4] = static_cast<double>(aim);
 }
 
 void Run::Getdata() {
