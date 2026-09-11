@@ -152,10 +152,10 @@ void setup() {
     // This is intentionally the first hardware operation.
     car.BeginSafe();
 
-    Serial.begin(MotionConfig::kDebugBaud);
+    // GPIO6/GPIO7 Serial1 is the single bidirectional command/diagnostic UART.
     Serial1.begin(MotionConfig::kLinkBaud, SERIAL_8N1,
                   Pins::LINK_RX, Pins::LINK_TX);
-    Serial.println("[STOP] POWER_ON latched=0");
+    Serial1.println("[STOP] POWER_ON latched=0");
 
     car.EncoderSetup(Pins::ENCODER_A_A, Pins::ENCODER_A_B,
                      Pins::ENCODER_B_A, Pins::ENCODER_B_B,
@@ -168,8 +168,8 @@ void setup() {
         MotionConfig::kServoMinimumPulseUs,
         MotionConfig::kServoMaximumPulseUs);
     trackingServo.writeMicroseconds(servoPulseUs);
-    Serial.printf("[BOOT] SERVO_ATTACH_RESULT=%d pin=%d\n",
-                  servoAttachResult, MotionConfig::kServoPin);
+    Serial1.printf("[BOOT] SERVO_ATTACH_RESULT=%d pin=%d\n",
+                   servoAttachResult, MotionConfig::kServoPin);
 
     if (!car.MPUSetup(Pins::IMU_SCL, Pins::IMU_SDA)) {
         latchFault(StopReason::ImuInitFailed);
@@ -180,8 +180,8 @@ void setup() {
     lastControlMs = now;
     lastDhtSampleMs = now;
     lastSerialDiagnosticMs = now;
-    Serial.println("[MODE] SAFE");
-    Serial.println("[BOOT] READY protocol=V2 fault_reset=1");
+    Serial1.println("[MODE] SAFE");
+    Serial1.println("[BOOT] READY protocol=V2 fault_reset=1");
 }
 
 void loop() {
@@ -257,10 +257,10 @@ void setStopped(StopReason reason) {
     }
     car.Stop();
     if (changed) {
-        Serial.printf("[STOP] %s latched=%d\n",
-                      stopReasonName(reason), faultLatched ? 1 : 0);
+        Serial1.printf("[STOP] %s latched=%d\n",
+                       stopReasonName(reason), faultLatched ? 1 : 0);
         if (reason == StopReason::TargetLost) {
-            Serial.println("[TARGET] LOST");
+            Serial1.println("[TARGET] LOST");
         }
     }
 }
@@ -270,7 +270,7 @@ void latchFault(StopReason reason) {
     faultLatched = true;
     targetAvailable = false;
     if (firstFault) {
-        Serial.printf("[FAULT] %s\n", stopReasonName(reason));
+        Serial1.printf("[FAULT] %s\n", stopReasonName(reason));
     }
     setStopped(reason);
 }
@@ -290,7 +290,7 @@ void changeControlMode(ControlMode mode) {
     manualMotionActive = false;
     manualMotionSpeed = 0;
     controlMode = mode;
-    Serial.printf("[MODE] %s\n", controlModeName(controlMode));
+    Serial1.printf("[MODE] %s\n", controlModeName(controlMode));
 }
 
 bool startManualMotion(MotionMode mode, int speed, uint32_t now) {
@@ -309,8 +309,8 @@ bool startManualMotion(MotionMode mode, int speed, uint32_t now) {
         }
         car.Stop();
         motionMode = mode;
-        Serial.printf("[MOTION] %s speed=%d\n",
-                      motionModeName(mode), speed);
+        Serial1.printf("[MOTION] %s speed=%d\n",
+                       motionModeName(mode), speed);
     }
     manualMotionSpeed = speed;
     manualMotionActive = true;
@@ -448,7 +448,7 @@ void updateHeadFromTarget(int32_t dx, uint32_t now) {
     if (lastHeadLogMs == 0
         || elapsedAtLeast(now, lastHeadLogMs,
                           MotionConfig::kDiagnosticRepeatMs)) {
-        Serial.printf("[HEAD] TARGET pulse=%d\n", servoPulseUs);
+        Serial1.printf("[HEAD] TARGET pulse=%d\n", servoPulseUs);
         lastHeadLogMs = now;
     }
 }
@@ -475,7 +475,7 @@ bool handleHeadCommand(const char* action, int step, uint32_t now) {
     if (lastHeadLogMs == 0
         || elapsedAtLeast(now, lastHeadLogMs,
                           MotionConfig::kDiagnosticRepeatMs)) {
-        Serial.printf("[HEAD] %s pulse=%d\n", action, servoPulseUs);
+        Serial1.printf("[HEAD] %s pulse=%d\n", action, servoPulseUs);
         lastHeadLogMs = now;
     }
     return true;
@@ -503,19 +503,19 @@ void handleValidTarget(const TargetFrame& frame, uint32_t now) {
 void markValidLinkCommand(uint32_t now) {
     if (linkTimedOut) {
         linkTimedOut = false;
-        Serial.println("[RECOVER] LINK_RESTORED");
+        Serial1.println("[RECOVER] LINK_RESTORED");
     }
     haveValidLinkCommand = true;
     lastValidLinkCommandMs = now;
 }
 
 void reportStatus() {
-    Serial.printf("[STATUS] mode=%s motion=%s stop=%s fault=%d target=%d "
-                  "servo=%d imu=%d\n",
-                  controlModeName(controlMode), motionModeName(motionMode),
-                  stopReasonName(stopReason), faultLatched ? 1 : 0,
-                  targetAvailable ? 1 : 0, servoPulseUs,
-                  car.imuReady() ? 1 : 0);
+    Serial1.printf("[STATUS] mode=%s motion=%s stop=%s fault=%d target=%d "
+                   "servo=%d imu=%d\n",
+                   controlModeName(controlMode), motionModeName(motionMode),
+                   stopReasonName(stopReason), faultLatched ? 1 : 0,
+                   targetAvailable ? 1 : 0, servoPulseUs,
+                   car.imuReady() ? 1 : 0);
 }
 
 bool handleCommandLine(const char* line, uint32_t now) {
@@ -698,9 +698,9 @@ void reportSerialDiagnostics(uint32_t now) {
     }
     lastSerialDiagnosticMs = now;
     if (malformedLineCount != 0 || discardedLineCount != 0) {
-        Serial.printf("[LINK] rejected malformed=%lu discarded=%lu\n",
-                      static_cast<unsigned long>(malformedLineCount),
-                      static_cast<unsigned long>(discardedLineCount));
+        Serial1.printf("[LINK] rejected malformed=%lu discarded=%lu\n",
+                       static_cast<unsigned long>(malformedLineCount),
+                       static_cast<unsigned long>(discardedLineCount));
         malformedLineCount = 0;
         discardedLineCount = 0;
     }
@@ -842,7 +842,7 @@ void sampleDhtWhenStopped(uint32_t now) {
     const float celsius = dht.readTemperature();
     const float fahrenheit = dht.readTemperature(true);
     if (!isnan(humidity) && !isnan(celsius) && !isnan(fahrenheit)) {
-        Serial.printf("[ENV] humidity=%.2f celsius=%.2f fahrenheit=%.2f\n",
-                      humidity, celsius, fahrenheit);
+        Serial1.printf("[ENV] humidity=%.2f celsius=%.2f fahrenheit=%.2f\n",
+                       humidity, celsius, fahrenheit);
     }
 }
