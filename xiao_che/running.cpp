@@ -247,7 +247,7 @@ bool Run::MPUSetup(int SCL, int SDA) {
             _imuReady = false;
             return false;
         }
-        Serial.println("[IMU] detected MPU6050");
+        Serial1.println("[IMU] detected MPU6050");
     } else if (whoAmI == kMpu6500WhoAmI) {
         _imuType = ImuType::MPU6500;
 
@@ -260,9 +260,9 @@ bool Run::MPUSetup(int SCL, int SDA) {
             return false;
         }
         delay(100);
-        Serial.println("[IMU] detected MPU6500");
+        Serial1.println("[IMU] detected MPU6500");
     } else {
-        Serial.printf("[IMU] unsupported WHO_AM_I=0x%02X\n", whoAmI);
+        Serial1.printf("[IMU] unsupported WHO_AM_I=0x%02X\n", whoAmI);
         _imuType = ImuType::Unknown;
         _imuReady = false;
         return false;
@@ -283,9 +283,9 @@ bool Run::MPUSetup(int SCL, int SDA) {
     _input[4] = 0;
     aim = 0;
     _imuReady = true;
-    Serial.printf("[IMU] READY type=%s bias=%.6f\n",
-                  _imuType == ImuType::MPU6500 ? "MPU6500" : "MPU6050",
-                  Bias);
+    Serial1.printf("[IMU] READY type=%s bias=%.6f\n",
+                   _imuType == ImuType::MPU6500 ? "MPU6500" : "MPU6050",
+                   Bias);
     return true;
 }
 
@@ -461,10 +461,10 @@ void Run::syncAimToCurrentHeading() {
 }
 
 void Run::Getdata() {
-    Serial.printf("%.2f %.2f %.2f %.2f %.2f    ",
-                  _input[0], _input[1], _input[2], _input[3], _input[4]);
-    Serial.printf("%.2f %.2f %.2f %.2f %.2f\n",
-                  _output[0], _output[1], _output[2], _output[3], _output[4]);
+    Serial1.printf("%.2f %.2f %.2f %.2f %.2f    ",
+                   _input[0], _input[1], _input[2], _input[3], _input[4]);
+    Serial1.printf("%.2f %.2f %.2f %.2f %.2f\n",
+                   _output[0], _output[1], _output[2], _output[3], _output[4]);
 }
 
 int Run::getAim() {
