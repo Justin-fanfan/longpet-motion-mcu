@@ -12,6 +12,12 @@ enum class MotionResult : uint8_t {
     ImuFault
 };
 
+enum class ImuType : uint8_t {
+    Unknown,
+    MPU6050,
+    MPU6500
+};
+
 class Run {
   private:
     int _ain1, _ain2, _bin1, _bin2, _cin1, _cin2, _din1, _din2;
@@ -32,6 +38,7 @@ class Run {
     bool _turnActive = false;
     int _turnDirection = 0;
     bool _imuReady = false;
+    ImuType _imuType = ImuType::Unknown;
     double Bias = 0;
     int aim = 0;
 
@@ -41,6 +48,9 @@ class Run {
     void _resetPidState();
     void _setMotor(int pin1, int pin2, int motorIndex, int expect,
                    double correction);
+    bool _readImuRegister(uint8_t reg, uint8_t& value);
+    bool _writeImuRegister(uint8_t reg, uint8_t value);
+    bool _readGyroZ(double& radiansPerSecond);
     bool _updateHeading(int angle, float elapsedSeconds);
     MotionResult _rotate(int direction, int speed, float elapsedSeconds);
     MotionResult _turn(int direction, int speed, int angle,

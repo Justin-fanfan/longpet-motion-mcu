@@ -10,6 +10,14 @@
 namespace {
 constexpr double kEncoderScaleBaseline = 0.151;
 constexpr double kRadiansToDegrees = 57.29577951308232;
+constexpr double kDegreesToRadians = 0.017453292519943295;
+constexpr uint8_t kWhoAmIRegister = 0x75;
+constexpr uint8_t kPowerManagement1Register = 0x6B;
+constexpr uint8_t kGyroConfigRegister = 0x1B;
+constexpr uint8_t kGyroZOutHighRegister = 0x47;
+constexpr uint8_t kMpu6050WhoAmI = 0x68;
+constexpr uint8_t kMpu6500WhoAmI = 0x70;
+constexpr double kGyroSensitivity250Dps = 131.0;
 }
 
 Run::Run(int ain1, int ain2, int bin1, int bin2, int cin1, int cin2,
@@ -127,17 +135,76 @@ void Run::_setMotor(int pin1, int pin2, int motorIndex,
               static_cast<uint32_t>(boundedOutput));
 }
 
+bool Run::_readImuRegister(uint8_t reg, uint8_t& value) {
+    Wire.beginTransmission(static_cast<uint8_t>(MotionConfig::kImuAddress));
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) {
+        return false;
+    }
+
+    if (Wire.requestFrom(static_cast<uint8_t>(MotionConfig::kImuAddress),
+                         static_cast<uint8_t>(1)) != 1) {
+        return false;
+    }
+
+    value = Wire.read();
+    return true;
+}
+
+bool Run::_writeImuRegister(uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(static_cast<uint8_t>(MotionConfig::kImuAddress));
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+bool Run::_readGyroZ(double& radiansPerSecond) {
+    if (_imuType == ImuType::MPU6050) {
+        if (!MPU.getEvent(&a, &g, &t)) {
+            return false;
+        }
+        radiansPerSecond = g.gyro.z;
+        return true;
+    }
+
+    if (_imuType == ImuType::MPU6500) {
+        Wire.beginTransmission(static_cast<uint8_t>(MotionConfig::kImuAddress));
+        Wire.write(kGyroZOutHighRegister);
+        if (Wire.endTransmission(false) != 0) {
+            return false;
+        }
+
+        if (Wire.requestFrom(static_cast<uint8_t>(MotionConfig::kImuAddress),
+                             static_cast<uint8_t>(2)) != 2) {
+            return false;
+        }
+
+        const uint8_t high = Wire.read();
+        const uint8_t low = Wire.read();
+        const int16_t raw = static_cast<int16_t>(
+            (static_cast<uint16_t>(high) << 8) | low);
+        const double degreesPerSecond =
+            static_cast<double>(raw) / kGyroSensitivity250Dps;
+        radiansPerSecond = degreesPerSecond * kDegreesToRadians;
+        return true;
+    }
+
+    return false;
+}
+
 bool Run::_updateHeading(int angle, float elapsedSeconds) {
     if (!_imuReady || !std::isfinite(elapsedSeconds)
         || elapsedSeconds <= 0.0f) {
         return false;
     }
-    if (!MPU.getEvent(&a, &g, &t)) {
+
+    double gyroZ = 0;
+    if (!_readGyroZ(gyroZ)) {
         _imuReady = false;
         return false;
     }
 
-    const double correctedRate = g.gyro.z - Bias;
+    const double correctedRate = gyroZ - Bias;
     if (correctedRate >= 0.005 || correctedRate <= -0.015) {
         // Integrate with the measured interval, not an assumed 100 ms.
         _input[4] += correctedRate * elapsedSeconds * kRadiansToDegrees;
@@ -163,7 +230,40 @@ void Run::PIDSetup(double Kp, double Ki, double Kd) {
 
 bool Run::MPUSetup(int SCL, int SDA) {
     Wire.begin(SDA, SCL);
-    if (!MPU.begin(MotionConfig::kImuAddress, &Wire)) {
+    Wire.setClock(100000);
+    delay(100);
+
+    uint8_t whoAmI = 0;
+    if (!_readImuRegister(kWhoAmIRegister, whoAmI)) {
+        _imuType = ImuType::Unknown;
+        _imuReady = false;
+        return false;
+    }
+
+    if (whoAmI == kMpu6050WhoAmI) {
+        _imuType = ImuType::MPU6050;
+        if (!MPU.begin(MotionConfig::kImuAddress, &Wire)) {
+            _imuType = ImuType::Unknown;
+            _imuReady = false;
+            return false;
+        }
+        Serial1.println("[IMU] detected MPU6050");
+    } else if (whoAmI == kMpu6500WhoAmI) {
+        _imuType = ImuType::MPU6500;
+
+        // MPU6500-compatible path: wake the device and keep the gyro at
+        // +/-250 deg/s so the raw-data scale remains 131 LSB/(deg/s).
+        if (!_writeImuRegister(kPowerManagement1Register, 0x01)
+            || !_writeImuRegister(kGyroConfigRegister, 0x00)) {
+            _imuType = ImuType::Unknown;
+            _imuReady = false;
+            return false;
+        }
+        delay(100);
+        Serial1.println("[IMU] detected MPU6500");
+    } else {
+        Serial1.printf("[IMU] unsupported WHO_AM_I=0x%02X\n", whoAmI);
+        _imuType = ImuType::Unknown;
         _imuReady = false;
         return false;
     }
@@ -171,17 +271,21 @@ bool Run::MPUSetup(int SCL, int SDA) {
     Bias = 0;
     for (size_t sample = 0; sample < MotionConfig::kImuCalibrationSamples;
          ++sample) {
-        if (!MPU.getEvent(&a, &g, &t)) {
+        double gyroZ = 0;
+        if (!_readGyroZ(gyroZ)) {
             _imuReady = false;
             return false;
         }
-        Bias += g.gyro.z;
+        Bias += gyroZ;
         delay(MotionConfig::kImuCalibrationDelayMs);
     }
     Bias /= MotionConfig::kImuCalibrationSamples;
     _input[4] = 0;
     aim = 0;
     _imuReady = true;
+    Serial1.printf("[IMU] READY type=%s bias=%.6f\n",
+                   _imuType == ImuType::MPU6500 ? "MPU6500" : "MPU6050",
+                   Bias);
     return true;
 }
 
@@ -357,10 +461,10 @@ void Run::syncAimToCurrentHeading() {
 }
 
 void Run::Getdata() {
-    Serial.printf("%.2f %.2f %.2f %.2f %.2f    ",
-                  _input[0], _input[1], _input[2], _input[3], _input[4]);
-    Serial.printf("%.2f %.2f %.2f %.2f %.2f\n",
-                  _output[0], _output[1], _output[2], _output[3], _output[4]);
+    Serial1.printf("%.2f %.2f %.2f %.2f %.2f    ",
+                   _input[0], _input[1], _input[2], _input[3], _input[4]);
+    Serial1.printf("%.2f %.2f %.2f %.2f %.2f\n",
+                   _output[0], _output[1], _output[2], _output[3], _output[4]);
 }
 
 int Run::getAim() {
