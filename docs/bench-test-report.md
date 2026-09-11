@@ -1,218 +1,220 @@
-# ESP32-S3 Motion Protocol V2 台架验收报告
+# ESP32-S3 Motion Protocol V2 台架验收记录
 
 日期：2026-09-11
 
-## 1. 当前状态
+本文档记录当前 V2 固件的台架验收状态。它既不是“全部未验证”的旧测试计划，也不是“全部通过”的最终验收证书；
+只把已经实际确认的项目标记为通过，其余继续保留为待测。
 
-本文件是可复现的 V2 台架步骤，不是已通过的硬件报告。本轮未烧录、未连接
-实物运动平台、未执行电机或舵机实测；下列 35 项均标记为“未验证”。编译状态
-以 `firmware-baseline.md` 和最终汇报为准。
+测试前置条件：
 
-测试前置条件：四轮全部架空；附近无人员、线缆和松动物；TB6612 电机电源可立即断开；先确认 Servo 1.3.0 的实际库路径及 PWM 资源不占 LEDC 4～7。所有可能驱动底盘的用例 17..22、35 必须架空执行。
+- 新的底盘动作第一次测试必须架空四轮；
+- TB6612 电机电源应可快速断开；
+- 控制/诊断 UART 为 `Serial1`，115200 8N1，RX=GPIO6，TX=GPIO7；
+- 当前日志和 `STATUS` 都从 `Serial1` 返回；
+- 左右平移已知存在实机问题，当前不作为下一阶段阻塞项。
 
-## 2. V2 验收矩阵（当前均未验证）
+状态说明：
 
-除特别说明外，每一项的结果栏都必须由用户在指定硬件上填写；静态代码检查
-不能替代这些记录。
+- ✅ 已验证：本轮已有明确实机结果；
+- ⚠️ 已发现问题：实机执行但结果不符合预期；
+- ⏳ 待验证：尚未记录完整实机结论；
+- ➖ 暂缓：当前版本不依赖，留待后续。
 
-### A. Boot Safety
+---
 
-| # | 操作 | 预期 |
+## 1. 当前已确认结果
+
+### A. Boot / IMU
+
+| # | 项目 | 结果 | 记录 |
+|---:|---|---|---|
+| 1 | 上电进入 `SAFE` | ✅ | 启动日志包含 `[MODE] SAFE` |
+| 2 | 上电默认停车 | ✅ | 未出现上电自行驱动底盘现象 |
+| 3 | I2C 设备地址 0x68 | ✅ | 可正常访问 |
+| 4 | `WHO_AM_I=0x70` | ✅ | 识别为 MPU6500-compatible |
+| 5 | Gyro Z 读取 | ✅ | 初始化与后续运动控制可工作 |
+| 6 | bias 校准 | ✅ | 实测 `-0.018949 rad/s` |
+| 7 | `IMU_INIT_FAILED` 修复 | ✅ | 启动进入 READY，不再锁存该故障 |
+
+典型启动日志：
+
+```text
+[STOP] POWER_ON latched=0
+[BOOT] SERVO_ATTACH_RESULT=0 pin=2
+[IMU] detected MPU6500
+[IMU] READY type=MPU6500 bias=-0.018949
+[MODE] SAFE
+[BOOT] READY protocol=V2 fault_reset=1
+```
+
+`SERVO_ATTACH_RESULT=0` 不应单独解释为舵机失败；本轮舵机已经通过物理动作验证。
+
+### B. UART
+
+| # | 项目 | 结果 | 记录 |
+|---:|---|---|---|
+| 8 | Motion MCU -> Host | ✅ | 启动/诊断日志可接收 |
+| 9 | Host -> Motion MCU | ✅ | `MODE` / `MOVE` / `HEAD` 等可执行 |
+| 10 | 双向 UART | ✅ | 使用另一块 ESP32 透明桥接打通 |
+
+转接 ESP32 推荐透明透传：
+
+```cpp
+void loop() {
+    while (Serial.available()) {
+        Serial1.write(Serial.read());
+    }
+    while (Serial1.available()) {
+        Serial.write(Serial1.read());
+    }
+}
+```
+
+### C. Manual chassis
+
+| # | 操作 | 当前结果 |
 |---:|---|---|
-| 1 | 上电，不发送 UART | 四轮不动，模式为 `SAFE`，`faultLatched=0` |
-| 2 | 上电后等待 30 秒 | STBY 持续安全，实际电机 PWM 4..7 保持 0 |
+| 11 | `MOVE FORWARD <speed>` | ✅ 前进正常 |
+| 12 | `MOVE BACKWARD <speed>` | ✅ 后退正常 |
+| 13 | `MOVE ROTATE_LEFT <speed>` | ✅ 原地左转正常 |
+| 14 | `MOVE ROTATE_RIGHT <speed>` | ✅ 原地右转正常 |
+| 15 | `MOVE SHIFT_LEFT <speed>` | ⚠️ 有问题，暂缓 |
+| 16 | `MOVE SHIFT_RIGHT <speed>` | ⚠️ 有问题，暂缓 |
 
-### B. Protocol parsing
+左右平移后续重点检查：
 
-| # | 操作 | 预期 |
-|---:|---|---|
-| 3 | 发送 `PING` | 不运动；仅刷新 general link timestamp |
-| 4 | 发送乱码/非打印字节并换行 | 整行拒绝，不运动、不刷新 TTL |
-| 5 | 分两次发送 `MODE MANUAL\\r\\n` 或半包命令 | 仅完整行生效；半包期间不运动 |
-| 6 | 发送超过 63 个有效字符后换行 | 丢弃到换行，不运动、不执行尾部内容 |
-| 7 | 发送 `MOVE FORWARD 20 extra`、未知 command、溢出整数 | 整行拒绝，不运动、不刷新 TTL |
-
-### C. Mode safety
-
-| # | 操作 | 预期 |
-|---:|---|---|
-| 8 | `MODE SAFE`，再发送任意 `MOVE` | MOVE 不合法、不运动 |
-| 9 | `MODE HEAD_ONLY`，持续 `TARGET 80 0 7400` | Servo 可调整；四轮始终不动 |
-| 10 | HEAD_ONLY 持续极大正 `dx` | Servo 到安全一侧限位并 clamp；四轮仍不动 |
-| 11 | HEAD_ONLY 持续极大负 `dx` | Servo 到另一安全侧限位并 clamp；四轮仍不动 |
-| 12 | HEAD_ONLY 发送 `TARGET 0 0 0` | `targetAvailable=0`，记录 `TARGET_LOST`，不动车 |
+- 麦克纳姆轮安装方向；
+- A/B/C/D 电机映射；
+- 四轮正反符号；
+- 编码器符号；
+- shift 轮速组合和 PID 输出方向。
 
 ### D. Manual head
 
-| # | 操作 | 预期 |
+| # | 操作 | 当前结果 |
 |---:|---|---|
-| 13 | `MODE MANUAL`，发送 `HEAD LEFT 20` | Servo 左移一个 20 us 小步 |
-| 14 | 发送 `HEAD RIGHT 20` | Servo 右移一个 20 us 小步 |
-| 15 | 发送 `HEAD CENTER` | Servo 回到 1570 us |
-| 16 | 重复 `HEAD LEFT 100` 与 `HEAD RIGHT 100` | 分别 clamp 到 870/2270，不能越界 |
+| 17 | `HEAD LEFT` | ✅ 正常 |
+| 18 | `HEAD RIGHT` | ✅ 正常 |
+| 19 | `HEAD CENTER` | ✅ 正常 |
+| 20 | 实际机械总行程 | ✅ 约 120° |
+| 21 | 870/2270 us 软件极限逐点边界验证 | ⏳ 尚未单独记录 |
 
-### E. Manual chassis（四轮架空）
+---
 
-| # | 操作 | 预期 |
-|---:|---|---|
-| 17 | MANUAL 持续 `MOVE FORWARD 20` | 仅按住期间前进；编码器 PID 工作 |
-| 18 | MANUAL 持续 `MOVE BACKWARD 20` | 仅按住期间后退；确认物理方向 |
-| 19 | MANUAL 持续 `MOVE SHIFT_LEFT 20` | 确认物理左移方向 |
-| 20 | MANUAL 持续 `MOVE SHIFT_RIGHT 20` | 确认物理右移方向 |
-| 21 | MANUAL 持续 `MOVE ROTATE_LEFT 20` | 持续低速原地左旋，不等待 90°完成 |
-| 22 | MANUAL 持续 `MOVE ROTATE_RIGHT 20` | 持续低速原地右旋，不等待 90°完成 |
+## 2. 尚需补测的安全与协议矩阵
 
-### F. Stop and recovery
+### A. Parser robustness
 
-| # | 操作 | 预期 |
-|---:|---|---|
-| 23 | 运动过程中发送 `STOP` | 立即撤销四轮驱动；Servo 不回中 |
-| 24 | `STOP` 后再次持续 `MOVE FORWARD 20` | 可恢复运动，不需要 reset |
+| # | 操作 | 预期 | 状态 |
+|---:|---|---|---|
+| 22 | `PING` | 不运动，仅刷新 general link | ⏳ |
+| 23 | 半包命令 | 完整行前不执行 | ⏳ |
+| 24 | >63 字节行 | 丢弃到行尾 | ⏳ |
+| 25 | 乱码/非打印字节 | 拒绝整行 | ⏳ |
+| 26 | `MOVE FORWARD 20 extra` | 拒绝整行 | ⏳ |
+| 27 | 越界/溢出整数 | 拒绝整行 | ⏳ |
 
-### G. Watchdog
+### B. Mode safety
 
-| # | 操作 | 预期 |
-|---:|---|---|
-| 25 | MANUAL 以 10 Hz 刷新 `MOVE FORWARD 20` | 持续运动，不超时 |
-| 26 | 停止刷新 MOVE，等待约 500 ms | `MANUAL_COMMAND_TIMEOUT`，可恢复停车 |
-| 27 | 停止 MOVE，仅以 10 Hz 发送 `PING` | 仍在约 500 ms 后停车；PING 不续 MOVE lease |
+| # | 操作 | 预期 | 状态 |
+|---:|---|---|---|
+| 28 | `MODE SAFE` 后发 `MOVE` | 不运动 | ⏳ |
+| 29 | `MODE HEAD_ONLY` + `TARGET` | 可动头部，四轮不动 | ⏳ |
+| 30 | HEAD_ONLY 大正/负 `dx` | Servo clamp，四轮仍不动 | ⏳ |
+| 31 | `TARGET 0 0 0` | `TARGET_LOST` | ⏳ |
+| 32 | MANUAL 运动中切到 HEAD_ONLY | 立即停车并清旧 motion | ⏳ |
 
-### H. Recoverable link timeout
+注意：重复发送当前模式是 no-op；例如已经处于 `MANUAL` 时再次 `MODE MANUAL`，当前代码不会额外停车。
 
-| # | 操作 | 预期 |
-|---:|---|---|
-| 28 | MANUAL 运动中完全断开 UART | 约 500 ms 后 `LINK_TIMEOUT latched=0`，四轮停止 |
-| 29 | 恢复 UART，发送 `MODE MANUAL` 并持续有效 MOVE | 记录 `LINK_RESTORED`；无需 ESP reset 即可恢复 |
+### C. STOP / recovery
 
-### I. Latched fault
+| # | 操作 | 预期 | 状态 |
+|---:|---|---|---|
+| 33 | 运动中 `STOP` | 立即撤销四轮驱动 | ⏳ |
+| 34 | STOP 后重新持续 MOVE | 可恢复，无需 reset | ⏳ |
 
-| # | 操作 | 预期 |
-|---:|---|---|
-| 30 | 制造可控 IMU runtime fault | `IMU_RUNTIME_FAILED`，`faultLatched=1`，四轮停止 |
-| 31 | faultLatched 后发送 MOVE/TARGET/HEAD | 全部拒绝，不运动、不改 Servo |
-| 32 | faultLatched 后不 reset，继续发合法命令 | 仍锁存；只有 ESP reset/power cycle 后恢复 |
+### D. Watchdog
 
-### J. Mode switching
+| # | 操作 | 预期 | 状态 |
+|---:|---|---|---|
+| 35 | 10 Hz 持续 MOVE | 持续运动 | ⏳ |
+| 36 | 一条 MOVE 后完全静默 | 约 500 ms 停车，当前通常为 `LINK_TIMEOUT` | ⏳ |
+| 37 | 停 MOVE，但持续 PING/STATUS | 约 500 ms `MANUAL_COMMAND_TIMEOUT` | ⏳ |
+| 38 | UART 物理断开 | 活动底盘约 500 ms `LINK_TIMEOUT` | ⏳ |
+| 39 | 恢复 UART 后重新合法控制 | 可恢复，不需 reset | ⏳ |
 
-| # | 操作 | 预期 |
-|---:|---|---|
-| 33 | MANUAL Forward 中发送 `MODE HEAD_ONLY` | 先立即停车，旧 Forward 不会继续 |
-| 34 | HEAD_ONLY 有旧 TARGET 后发送 `MODE MANUAL` | 目标状态已清除；旧 TARGET 不会使车运动 |
+当前代码对活动 MANUAL 底盘先检查 general link timeout，再检查 manual lease；因此不要把“停止刷新 MOVE 后一定得到 `MANUAL_COMMAND_TIMEOUT`”写成固定结论。
 
-### K. Head + chassis concurrent
+### E. Latched fault
 
-| # | 操作 | 预期 |
-|---:|---|---|
-| 35 | MANUAL 持续 `MOVE FORWARD 20`，同时重复 `HEAD RIGHT 20` | 底盘持续 Forward，头部独立右移；任一流不会阻塞另一流 |
+| # | 操作 | 预期 | 状态 |
+|---:|---|---|---|
+| 40 | 制造 IMU runtime fault | `IMU_RUNTIME_FAILED` + `fault=1` | ⏳ |
+| 41 | fault 后发送 MOVE/TARGET/HEAD | 全部拒绝执行 | ⏳ |
+| 42 | fault 后 reset/power-cycle | 可恢复 | ⏳ |
+| 43 | `CONTROL_OVERRUN` 路径 | 锁存并停车 | ⏳ |
 
-建议每项记录 USB debug `Serial` 输出、两路 STBY 电平、PWM/Servo 波形和
-必要的时间戳。完成后把“未验证”替换为实测值与判定，不要把编译或静态分析
-结果填写成硬件通过。
+当前只有一个 `stopReason` 字段。严重 fault 后如果再 `STOP` 或真正切换模式，`faultLatched` 仍为 1，但 stop reason 可能被覆盖；验收时必须保存首次 `[FAULT]` 日志。
 
-### V2 日志判读
+### F. Head + chassis concurrency
 
-在 USB debug `Serial` 上应观察到与当前状态一致的低频日志，例如：
+| # | 操作 | 预期 | 状态 |
+|---:|---|---|---|
+| 44 | 持续 `MOVE FORWARD` 同时发 `HEAD LEFT/RIGHT/CENTER` | 两路互不阻塞 | ⏳ |
+
+已经准备了转接 ESP32 自动测试方式，但当前没有记录最终实测判定，因此本项暂不标 PASS。
+
+### G. Vision / TARGET
+
+| # | 操作 | 预期 | 状态 |
+|---:|---|---|---|
+| 45 | HEAD_ONLY 约 10 Hz `TARGET` | 头部连续跟踪 | ⏳ |
+| 46 | Detector correction 较慢时 Tracker 更新 | Publisher 仍保持约 10 Hz 最新目标 | ⏳ |
+| 47 | 目标 stale / lost | 发送 `TARGET 0 0 0`，不保留旧目标 | ⏳ |
+| 48 | FOLLOW `TARGET` | 当前不得驱动底盘 | ⏳ |
+
+---
+
+## 3. 日志判读
+
+所有当前 V2 日志从 `Serial1` 返回，而不是另设 USB debug `Serial`。
+
+常见日志：
 
 ```text
 [STOP] POWER_ON latched=0
+[IMU] detected MPU6500
+[IMU] READY type=MPU6500 bias=...
 [MODE] MANUAL
 [MOTION] FORWARD speed=20
-[HEAD] RIGHT pulse=1590
-[STOP] MANUAL_COMMAND_TIMEOUT latched=0
+[HEAD] RIGHT pulse=...
 [STOP] LINK_TIMEOUT latched=0
+[STOP] MANUAL_COMMAND_TIMEOUT latched=0
 [RECOVER] LINK_RESTORED
 [FAULT] IMU_RUNTIME_FAILED
-[STOP] IMU_RUNTIME_FAILED latched=1
+[STATUS] mode=... motion=... stop=... fault=... target=... servo=... imu=...
 ```
 
-HEAD_ONLY/FOLLOW 的 TARGET 不应出现任何 `[MOTION]`；HEAD_ONLY 即使 Servo
-到极限也不应出现转弯日志。`STATUS` 的输出应同时反映 mode、motion、stop、
-fault、target、servo 和 imu 字段。
+HEAD 日志有约 2 秒限频，因此快速重复 HEAD 时不要要求每条命令都有一条 `[HEAD]`；可用 `STATUS` 检查 `servo=`。
 
-## 附录 A：V1 日志判读（已被 V2 验收矩阵替代）
+---
 
-调试 `Serial` 预期包含：
+## 4. 当前验收结论
 
-```text
-[STOP] POWER_ON latched=0
-[BOOT] SERVO_ATTACH_RESULT=...
-[BOOT] READY manual_reset_clears_faults=1
-[MOTION] FORWARD
-[STOP] TARGET_LOST latched=0
-[STOP] LINK_TIMEOUT latched=1
-[STOP] TURN_TIMEOUT latched=1
-[LINK] rejected malformed=... discarded=...
-```
+当前已经足以确认：
 
-故障锁存后继续发送合法目标也不得出现新的 `[MOTION]`；必须按 ESP32-S3 Reset 或重新上电恢复。
+- UART 双向链路可用；
+- MPU6500-compatible 路径可用；
+- 前进、后退、原地左右转可用；
+- 头部舵机左右与回中可用；
+- 左右平移当前存在问题，但不阻塞现阶段 HEAD_ONLY / manual 基础能力。
 
-### 附录 A.1：V1 UART 准备（历史步骤）
+当前**不能**声称：
 
-龙芯 UART2 的 Linux 节点尚未知。先做只读识别，不发送数据：
+- 全部安全 watchdog 已实机逐项通过；
+- HEAD_ONLY 视觉闭环已完成；
+- 底盘 + Servo 并发已最终验收；
+- FOLLOW 自动跟随已可用；
+- 左右平移已经正常。
 
-```sh
-cat /proc/device-tree/aliases/serial2 2>/dev/null
-dmesg | grep -Ei 'tty|uart|serial'
-ls -l /sys/class/tty
-```
-
-确认节点后把下文 `<UART_NODE>` 替换为实际值。不要假定 `/dev/ttyS2`，也不要使用此前维护龙芯的 COM9。
-
-串口配置命令本身不驱动电机：
-
-```sh
-stty -F <UART_NODE> 115200 cs8 -cstopb -parenb -crtscts raw -echo
-```
-
-任何发送 `area > 0` 的命令都有可能驱动舵机或电机，以下明确标注“可能驱动电机”的命令只可在架空四轮后执行。持续运动用例必须以至少 10 Hz 重复发送，否则 500 ms 后会按设计进入 `LINK_TIMEOUT` 锁存。
-
-### 附录 A.2：V1 验收用例（历史步骤）
-
-| # | 用例 | 操作与预期 | 本轮结果 |
-|---:|---|---|---|
-| 1 | 上电静止 30 秒 | 不接龙芯发送端；四路 PWM 应为 0，两组 STBY 为 LOW，四轮无驱动 | 待用户测试 |
-| 2 | 居中远目标 | **可能驱动电机**：10 Hz 持续发送 `0 0 4000\r\n`；应进入 `FORWARD` | 待用户测试 |
-| 3 | 居中近目标 | **可能驱动电机**：10 Hz 持续发送 `0 0 12000\r\n`；应为 `TARGET_NEAR` 且撤销驱动 | 待用户测试 |
-| 4 | 目标丢失 | 先执行用例 2，再发送 `0 0 0\r\n`；应立即记录 `TARGET_LOST`，不继续调舵机 | 待用户测试 |
-| 5 | 通信中断 | 先执行用例 2，再停止发送/拔 UART；测最后合法帧至两组 STBY 下降时间，应记录 `LINK_TIMEOUT` | 待用户测试 |
-| 6 | 断联恢复禁止自动运动 | 用例 5 后重新以 10 Hz 发送 `0 0 4000`；不得运动；人工复位后才可重新进入 | 待用户测试 |
-| 7 | 串口鲁棒性 | 发送半包、乱码、64+ 字节行、多余字段和连续多行；错误输入不得延长 500 ms 时限或触发动作 | 待用户测试 |
-| 8 | 左右转完成/超时 | **可能驱动电机**：用持续正/负 dx 逐步把舵机推至相应限位；确认原轮向映射、±2°完成和 3 秒超时锁存 | 待用户测试 |
-| 9 | 连续启停 10 次 | **可能驱动电机**：在 `0 0 4000` 与 `0 0 0` 间循环；每次启动不得复用旧 PWM/转弯状态 | 待用户测试 |
-| 10 | MPU 初始化失败 | 断电后断开 MPU/I2C，再上电；应记录 `IMU_INIT_FAILED` 且两组 STBY 始终 LOW | 待用户测试 |
-| 11 | 停车不影响舵机 PWM | 示波器/逻辑分析仪同时观察 GPIO2、PWMA-D、STBY；停车时电机 PWM 4～7 清零，但 GPIO2 舵机脉冲不应被错误清零 | 待用户测试 |
-
-中间区边界另测 `0 0 5000` 和 `0 0 10000`，两者都应记录 `AREA_HOLD` 并停车。`dx=0` 用例是必测项，用于证明距离判断不再依赖 `dx != 0`。
-
-### 附录 A.3：V1 建议发送方式（历史步骤）
-
-以下示例**可能驱动电机**，只能架空四轮执行。它持续 10 Hz 发送居中远目标，按 `Ctrl+C` 停止后应在 500 ms 左右撤销驱动并锁存：
-
-```sh
-while true; do printf '0 0 4000\r\n' > <UART_NODE>; sleep 0.1; done
-```
-
-乱码/额外字段测试本身不应驱动电机，但必须在已经确认停车的状态执行：
-
-```sh
-printf '1 2\nabc\n1 2 4000 extra\n2147483648 0 1\n' > <UART_NODE>
-```
-
-超长行应一次发送完并以换行收尾；其尾部不得被解释成下一条命令。多行合法输入可以一次写入，接收器会分多轮有界处理而不饿死控制检查。
-
-### 附录 A.4：V1 测量记录表（历史步骤）
-
-| 指标 | 实测值 | 判定 |
-|---|---:|---|
-| 上电至 STBY 明确为 LOW | 待测 | 待定 |
-| `TARGET_LOST` 最后字节至 STBY LOW | 待测 | 待定 |
-| 最后合法帧至 `LINK_TIMEOUT`/STBY LOW | 待测 | 目标约 500 ms，加一小段循环调度误差 |
-| STBY LOW 至四轮机械完全停止 | 待测 | 只记录，不与驱动撤销时间混淆 |
-| 左转完成角误差 | 待测 | 待定 |
-| 右转完成角误差 | 待测 | 待定 |
-| 转弯超时 | 待测 | 目标约 3000 ms |
-| 连续启停旧占空比残留 | 待测 | 应无残留 |
-
-### 附录 A.5：V1 通过门槛（历史步骤）
-
-只有在指定 Core/库版本和完整板卡选项下编译成功，并且 11 个架空台架用例逐项记录后，才能把本基线称为“硬件验证通过”。编译成功本身不能替代 GPIO、PWM、机械停车和故障锁存实测。
+下一阶段优先完成龙芯 UART 与 HEAD_ONLY 视觉联调，同时逐项补齐本文件中的 ⏳ 项。
