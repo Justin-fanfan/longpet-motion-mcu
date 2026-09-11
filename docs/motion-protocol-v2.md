@@ -2,47 +2,61 @@
 
 ## 1. Scope
 
-This document describes the ASCII command protocol between the LongPet host
-and the ESP32-S3 Motion Controller. The controller owns the head Servo, the
-four-wheel mecanum chassis, encoder PID, IMU heading hold, and the safety
-watchdog. It does not implement the LongPet network API or the FOLLOW vision
-algorithm.
+本文档描述 LongPet 主控与 ESP32-S3 Motion Controller 之间的 ASCII UART 协议。
+运动 MCU 负责头部 Servo、四轮麦克纳姆底盘、编码器 PID、IMU 航向反馈和安全 watchdog；
+网络 API、视觉检测/跟踪算法和 LongPet UI 不在本协议内。
 
-UART settings:
+UART：
 
 ```text
-115200 baud, 8 data bits, no parity, 1 stop bit, no flow control
-ESP32-S3 Serial1 RX = GPIO6, TX = GPIO7
+115200 baud, 8N1, no flow control
+ESP32-S3 Serial1 RX = GPIO6
+ESP32-S3 Serial1 TX = GPIO7
 ```
 
-Each command is one ASCII line terminated by `CR`, `LF`, or `CRLF`. The
-receiver uses a fixed 64-byte buffer, accepts partial input and multiple
-queued lines, and consumes at most 32 bytes per loop. Only a complete,
-well-formed command that is legal in the current mode counts as valid link
-traffic.
+所有控制命令、状态返回、启动日志和诊断日志都走同一条双向 `Serial1`。
 
-The parser accepts spaces between tokens and at the end of a line. Tabs,
-other control bytes, non-ASCII bytes, extra fields, unknown commands, integer
-overflow, and out-of-range values reject the whole line. A rejected line does
-not refresh any link, motion, or target timeout.
+每条命令是一行 ASCII，以 `CR`、`LF` 或 `CRLF` 结束。接收器使用固定 64-byte 缓冲，
+支持半包和多行积压；每次 `loop()` 最多处理 32 字节。只有完整、格式正确且在当前模式合法的命令才算有效链路流量。
+
+解析器只把普通空格当作 token 分隔符。Tab、其他控制字符、非 ASCII 字节、额外字段、未知命令、整数溢出或越界值都会拒绝整行；被拒绝的行不会刷新任何 timeout。
+
+---
 
 ## 2. Control modes
 
 | Mode | Purpose | Chassis behavior |
 |---|---|---|
-| `SAFE` | Default and explicit safe state | Always stopped; no automatic head movement |
-| `HEAD_ONLY` | Vision head-tracking test | `TARGET` may move the head; wheels are hard-blocked |
-| `MANUAL` | Family remote control | `HEAD` and refreshed `MOVE` commands operate independently |
-| `FOLLOW` | Future autonomous following | `TARGET` and head tracking are wired; chassis following is disabled until bbox-area calibration |
+| `SAFE` | 默认安全态 | 底盘保持停止 |
+| `HEAD_ONLY` | 视觉头部跟踪 | `TARGET` 可动头部，轮子硬阻止 |
+| `MANUAL` | 手动/家属遥控 | `HEAD` 与持续刷新的 `MOVE` 独立工作 |
+| `FOLLOW` | 未来自动跟随 | `TARGET` 与头部链路已接通，自动底盘暂时关闭 |
 
-The initial mode after reset is `SAFE`. Any actual mode change stops the
-chassis first and clears the active motion, manual motion lease, target
-freshness, angle-turn state, and other transient movement state. A mode change
-does not clear a latched fault; reset is still required for that.
+上电后初始模式为 `SAFE`。
+
+只有**切换到不同模式**时才会：
+
+- 先停车；
+- 清 active motion；
+- 清 MANUAL motion lease；
+- 清 target freshness；
+- 清瞬态运动状态。
+
+重复发送当前模式，例如车辆已经处于 `MANUAL` 时再次发送：
+
+```text
+MODE MANUAL
+```
+
+当前实现是 no-op，不会额外停车或清状态。
+
+模式切换不会清除 `faultLatched`。
+
+---
 
 ## 3. Commands
 
-### 3.1 Mode, stop, and diagnostics
+### 3.1 Mode / stop / diagnostics
 
 ```text
 MODE SAFE
@@ -55,19 +69,24 @@ STOP
 STATUS
 ```
 
-`MODE` is accepted in every mode and always leaves the selected mode stopped.
-`STOP` immediately disables both TB6612 STBY groups, clears the four motor PWM
-outputs and the active chassis command, and leaves the Servo at its current
-position. It does not force the Servo to center and does not itself clear a
-latched fault.
+`STOP` 立即进入统一停车路径：撤销 TB6612 STBY、清电机 PWM 和当前 chassis command；Servo 保持当前角度，不自动回中。
 
-`PING` proves that the UART link and host are alive. It refreshes only the
-general link timestamp. It never refreshes a MANUAL `MOVE` lease or a `TARGET`
-freshness timestamp, and therefore cannot keep an old movement running.
+`PING` 只证明 general UART link 仍然活着。它会刷新 general link timestamp，但不会刷新：
 
-`STATUS` prints the current mode, motion, stop reason, fault latch, target
-availability, Servo pulse, and IMU readiness to the USB debug `Serial`. It is
-not a response on `Serial1`.
+- MANUAL `MOVE` lease；
+- `TARGET` freshness。
+
+`STATUS` 从 **Serial1** 返回：
+
+```text
+[STATUS] mode=<...> motion=<...> stop=<...> fault=<0|1> target=<0|1> servo=<us> imu=<0|1>
+```
+
+例如：
+
+```text
+[STATUS] mode=MANUAL motion=STOPPED stop=STOP_COMMAND fault=0 target=0 servo=1570 imu=1
+```
 
 ### 3.2 Vision target
 
@@ -75,28 +94,36 @@ not a response on `Serial1`.
 TARGET <dx> <dy> <area>
 ```
 
-Ranges are inclusive:
+范围：
 
 | Parameter | Range | Meaning |
 |---|---:|---|
-| `dx` | `-4096..4096` | Horizontal image error |
-| `dy` | `-4096..4096` | Vertical image error; stored for future use |
-| `area` | `0..16777216` | Detector bbox/area value |
+| `dx` | `-4096..4096` | 目标中心相对画面中心的水平偏差 |
+| `dy` | `-4096..4096` | 垂直偏差；当前只校验和保存 |
+| `area` | `0..16777216` | bbox 像素面积 |
 
-`TARGET` is legal only in `HEAD_ONLY` and `FOLLOW`. `area == 0` means target
-lost: `targetAvailable` becomes false and the chassis is stopped. A nonzero
-target updates its own freshness timestamp and may update the head Servo.
+推荐视觉侧定义：
 
-In `HEAD_ONLY`, `TARGET` can never reach a wheel actuator. Large `dx`, a Servo
-limit, and repeated target frames all remain head-only behavior. The current
-head correction uses a 10-pixel deadband, a bounded correction of at most
-40 microseconds per frame, and pulse clamping to 870..2270 microseconds. It
-keeps the existing relation `servoPulseUs -= dx` (positive `dx` decreases the
-pulse), but scales large errors instead of applying raw pixels as microseconds.
+```text
+dx   = target_center_x - image_center_x
+dy   = target_center_y - image_center_y
+area = bbox_width * bbox_height
+```
 
-In `FOLLOW`, the same target/head path is available, but the old pixel-area
-thresholds 5000/10000 do not drive the chassis. FOLLOW distance thresholds are
-not calibrated yet for Tinyissimo V1.2 person bounding boxes.
+`TARGET` 只在 `HEAD_ONLY` / `FOLLOW` 合法。
+
+`area == 0` 表示目标丢失：`targetAvailable=false`，记录 `TARGET_LOST`。
+
+非零目标会更新 target freshness，并按 `dx` 调整头部。当前头部修正：
+
+- deadband：10 px；
+- 单次最大 correction：40 us；
+- Servo clamp：870..2270 us；
+- `dx > 0` 时 pulse 减小，`dx < 0` 时 pulse 增大。
+
+`HEAD_ONLY` 中 `TARGET` 永远不能进入底盘执行路径。
+
+`FOLLOW` 当前也不会依据 `area` 驱动底盘；5000/10000 仅是旧阈值保留值，尚未针对当前视觉 bbox 标定。
 
 ### 3.3 Head commands
 
@@ -106,14 +133,32 @@ HEAD RIGHT [step]
 HEAD CENTER
 ```
 
-These commands are legal only in `MANUAL`. `step` is an optional integer in
-`1..100` microseconds; the default is 20. LEFT decreases the Servo pulse and
-RIGHT increases it, matching the existing hardware direction convention.
-Every accepted step changes the current target position once. Repeating the
-command repeats the small position adjustment. When the host stops sending
-HEAD commands, the Servo simply holds its last position; there is no head
-watchdog and no automatic recentering. All positions are clamped to
-`870..2270` microseconds, with `HEAD CENTER` at `1570` microseconds.
+只在 `MANUAL` 合法。
+
+`step`：
+
+```text
+1..100 us
+默认 20 us
+```
+
+当前方向定义：
+
+```text
+LEFT  -> pulse -= step
+RIGHT -> pulse += step
+CENTER -> 1570 us
+```
+
+位置始终 clamp 到：
+
+```text
+870..2270 us
+```
+
+HEAD 是位置步进，不是 lease。停止发送后 Servo 保持最后位置，没有 head watchdog。
+
+注意：HEAD 日志按 `kDiagnosticRepeatMs=2000 ms` 限频，因此连续发送 HEAD 时不一定每条都立即出现 `[HEAD]`；需要精确确认位置时使用 `STATUS` 查看 `servo=`。
 
 ### 3.4 Manual chassis commands
 
@@ -126,46 +171,96 @@ MOVE SHIFT_LEFT <speed>
 MOVE SHIFT_RIGHT <speed>
 ```
 
-These commands are legal only in `MANUAL`. `speed` is an integer in
-`1..100` (`kMaximumSpeedCommand`). An invalid speed rejects the complete line;
-the firmware does not silently clamp a bad protocol value.
+只在 `MANUAL` 合法。
 
-Each accepted `MOVE` replaces the current manual chassis command and refreshes
-`lastManualMotionCommandMs`. It is a lease, not a latch: the host must keep
-refreshing it. The four motor outputs use the existing encoder PID and wheel
-mapping. `ROTATE_LEFT` and `ROTATE_RIGHT` are continuous in-place rotations;
-they have no target angle and run only while fresh `MOVE` commands arrive.
+`speed`：
 
-`LeftTurn(speed, angle)` and `RightTurn(speed, angle)` remain in the `Run`
-layer for future autonomous angle turns, but V2 manual rotation never calls
-them and never stops after an implicit 90-degree target.
+```text
+1..100
+```
+
+越界值直接拒绝，不会自动 clamp。
+
+每条合法 `MOVE` 都替换当前 manual chassis command，并刷新 `lastManualMotionCommandMs`。
+`ROTATE_LEFT/RIGHT` 是持续原地旋转，不带隐式 90°目标。
+
+当前实机状态：
+
+```text
+FORWARD       verified OK
+BACKWARD      verified OK
+ROTATE_LEFT   verified OK
+ROTATE_RIGHT  verified OK
+SHIFT_LEFT    known issue / deferred
+SHIFT_RIGHT   known issue / deferred
+```
+
+左右平移协议保留，但现阶段不要作为 LongPet 必需功能。
+
+---
 
 ## 4. Watchdogs and timestamps
 
-The firmware maintains three separate timestamps:
+固件维护三个独立 timestamp：
 
-| Timestamp | Refreshed by | Expiry behavior |
-|---|---|---|
-| `lastValidLinkCommandMs` | Any accepted legal command, including `PING` | Active chassis stops with recoverable `LINK_TIMEOUT` after 500 ms with no valid command |
-| `lastManualMotionCommandMs` | `MOVE` only in `MANUAL` | Chassis stops with recoverable `MANUAL_COMMAND_TIMEOUT` after 500 ms without a new `MOVE` |
-| `lastTargetCommandMs` | `TARGET` only in `HEAD_ONLY`/`FOLLOW` | Target becomes unavailable and chassis stops with recoverable `TARGET_LOST` after 500 ms |
+| Timestamp | Refreshed by | Timeout |
+|---|---|---:|
+| `lastValidLinkCommandMs` | 任意被接受的合法命令，包括 `PING` / `STATUS` / `MODE` | 500 ms |
+| `lastManualMotionCommandMs` | 仅 MANUAL `MOVE` | 500 ms |
+| `lastTargetCommandMs` | 仅 HEAD_ONLY/FOLLOW `TARGET` | 500 ms |
 
-The motion-specific watchdogs take precedence over the general link watchdog.
-For example, repeated `PING` commands cannot extend a stale MANUAL `MOVE`, and
-repeated `PING` commands cannot extend an old target. A new accepted command
-after a link timeout may restore link state; a new `MOVE` or fresh `TARGET` is
-still required to resume its associated function.
+### 4.1 MANUAL 实际 timeout 顺序
 
-The host should send repeated `MOVE` commands at 100..200 ms intervals and
-send `STOP` immediately when a button is released. A 10 Hz sender provides
-margin below the 500 ms lease.
+当前 `checkMotionTimeouts()` 对活动底盘的顺序是：
+
+1. general link timeout；
+2. MANUAL motion lease timeout。
+
+因此：
+
+- 只发一次 `MOVE`，之后完全没有任何合法命令：约 500 ms 后通常得到 `LINK_TIMEOUT`；
+- 持续发 `PING` / `STATUS` 保持 general link 新鲜，但不再发 `MOVE`：约 500 ms 后得到 `MANUAL_COMMAND_TIMEOUT`；
+- 两种情况都会停车。
+
+这意味着 `PING` **不能**延长运动，只会让停车原因更具体地落到 MANUAL lease。
+
+### 4.2 TARGET timeout
+
+HEAD_ONLY/FOLLOW 下，如果当前有有效目标且 500 ms 内没有新的合法 `TARGET`：
+
+```text
+TARGET_LOST
+```
+
+`PING` 不能刷新 target freshness。
+
+### 4.3 推荐发送频率
+
+MANUAL 持续运动：
+
+```text
+MOVE every 100..200 ms
+```
+
+视觉目标：
+
+```text
+TARGET about 10 Hz
+```
+
+按钮释放或上层需要明确停车时应立即发送：
+
+```text
+STOP
+```
+
+---
 
 ## 5. Stop and fault semantics
 
-### Recoverable stops
+### 5.1 Recoverable stops
 
-The following stop reasons do not set `faultLatched` and can recover after a
-new legal command:
+以下不会设置 `faultLatched`：
 
 - `POWER_ON`
 - `STOP_COMMAND`
@@ -173,115 +268,123 @@ new legal command:
 - `LINK_TIMEOUT`
 - `MODE_CHANGED`
 - `MANUAL_COMMAND_TIMEOUT`
-- head-only/follow hold states (`TARGET_TRACKING_ONLY`,
-  `FOLLOW_CHASSIS_DISABLED`)
+- `TARGET_TRACKING_ONLY`
+- `FOLLOW_CHASSIS_DISABLED`
 
-All of them call `Run::Stop()`: STBY is driven LOW, real motor LEDC channels
-4..7 are written with zero, direction pins are cleared, encoder windows and
-PID transient state are reset, and continuous-rotation state is ended.
+### 5.2 Latched faults
 
-### Latched faults
-
-The following remain latched until ESP reset or power cycle:
+以下会锁存，直到 ESP reset / power cycle：
 
 - `IMU_INIT_FAILED`
 - `IMU_RUNTIME_FAILED`
 - `CONTROL_OVERRUN`
 - `TURN_TIMEOUT`
-- another explicitly identified severe control/hardware failure
 
-While latched, `PING`, `STATUS`, and debug output remain available. `MOVE`,
-`TARGET`, and active `HEAD` commands are rejected; no chassis or active Servo
-movement can resume. A mode command may change the displayed mode, but never
-clears the fault latch.
+faultLatched 后：
+
+- `MOVE` / `TARGET` / active `HEAD` 被拒绝；
+- `PING` / `STATUS` / `STOP` / `MODE` 仍能被解析；
+- 改模式不会清 fault latch。
+
+### 5.3 当前诊断限制
+
+当前固件只有一个 `stopReason` 字段。发生锁存故障后，如果再发送 `STOP` 或切换到另一个模式，
+`faultLatched` 仍保持为 1，但 `stopReason` 可能被新的可恢复停车原因覆盖。
+
+因此排查严重故障时应保留并优先查看首次：
+
+```text
+[FAULT] ...
+```
+
+日志，不要只根据之后的 `STATUS stop=` 推断根因。
+
+---
 
 ## 6. Legacy compatibility
 
-The old three-integer line remains accepted as a compatibility spelling:
+旧格式仍兼容：
 
 ```text
 <dx> <dy> <area>
 ```
 
-It is interpreted exactly as `TARGET <dx> <dy> <area>`, and is legal only in
-`HEAD_ONLY` or `FOLLOW`. It no longer starts automatic `FORWARD` motion, does
-not select a hidden 90-degree turn when the Servo reaches a limit, and never
-uses the old 5000/10000 area thresholds to drive the chassis.
-
-## 7. LongPet family remote sending guide
-
-The family client should enter `MANUAL` before enabling the controls:
+它严格等价于：
 
 ```text
-MODE MANUAL\r\n
+TARGET <dx> <dy> <area>
 ```
 
-While the user holds Forward, send the current command about every 100 ms:
+也只在 `HEAD_ONLY` / `FOLLOW` 合法。
+
+旧格式不再：
+
+- 自动前进；
+- 在 Servo 到限位时自动 90°转弯；
+- 使用 5000/10000 area 阈值驱动底盘。
+
+新代码推荐统一使用显式 `TARGET`。
+
+---
+
+## 7. Sending guide
+
+### 7.1 Family/manual control
 
 ```text
-MOVE FORWARD 20\r\n
-MOVE FORWARD 20\r\n
-MOVE FORWARD 20\r\n
+MODE MANUAL
 ```
 
-When the button is released, send:
+按住 Forward 时约 10 Hz 重发：
 
 ```text
-STOP\r\n
+MOVE FORWARD 20
+MOVE FORWARD 20
+MOVE FORWARD 20
 ```
 
-The same pattern applies to Backward, Shift, and continuous rotation. A
-single `MOVE ROTATE_LEFT 20` is not a 90-degree command; it expires after the
-manual lease unless refreshed.
-
-Head buttons are position steps, not leases. While Head Left is held, repeat:
+释放：
 
 ```text
-HEAD LEFT 20\r\n
+STOP
 ```
 
-When released, stop sending that HEAD command. The Servo holds its current
-position. Head and chassis streams are independent, so this is valid:
+头部与底盘可以交错：
 
 ```text
-MOVE FORWARD 20\r\n
-HEAD RIGHT 20\r\n
+MOVE FORWARD 20
+HEAD RIGHT 20
+MOVE FORWARD 20
 ```
 
-The client may send `PING` for link diagnostics, but it must never use PING as
-the only keepalive for an active movement. On network, UART, process, or host
-failure, the absence of refreshed `MOVE` commands is the safety mechanism that
-stops the chassis.
-
-## 8. Examples by mode
-
-Head-only vision:
+### 7.2 Head-only vision
 
 ```text
-MODE HEAD_ONLY\r\n
-TARGET -85 12 7400\r\n
-TARGET -20 10 7300\r\n
-TARGET 0 8 0\r\n
+MODE HEAD_ONLY
+TARGET -85 12 7400
+TARGET -20 10 7300
+TARGET 0 8 0
 ```
 
-Manual concurrent control:
+### 7.3 FOLLOW placeholder
 
 ```text
-MODE MANUAL\r\n
-MOVE FORWARD 20\r\n
-HEAD RIGHT 20\r\n
-MOVE FORWARD 20\r\n
-STOP\r\n
-HEAD CENTER\r\n
+MODE FOLLOW
+TARGET 15 0 7400
 ```
 
-FOLLOW placeholder:
+当前只允许目标/头部路径工作，不允许自动底盘追踪。
 
-```text
-MODE FOLLOW\r\n
-TARGET 15 0 7400\r\n
-```
+---
 
-The last example may move the head but must not move the chassis until the
-Tinyissimo V1.2 bbox area/distance thresholds are separately calibrated and a
-future firmware change explicitly enables following.
+## 8. Current hardware verification
+
+截至 2026-09-11：
+
+- 双向 UART：通过；
+- MPU6500-compatible 检测、Gyro Z、bias：通过；
+- Forward / Backward / Rotate Left / Rotate Right：通过；
+- Shift Left / Shift Right：实机存在问题，暂缓；
+- Servo Left / Right / Center：通过，机械总活动范围约 120°；
+- 完整 STOP / timeout / 断线 / fault 安全矩阵：仍需逐项补测；
+- 底盘与 Servo 并发：已有测试方法，但尚未记录最终实测结论。
