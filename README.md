@@ -48,7 +48,7 @@ TX = GPIO7
 - `SAFE`：默认安全模式，底盘禁止运动。
 - `HEAD_ONLY`：接受 Vision `TARGET`，只驱动头部，底盘硬禁止运动。
 - `MANUAL`：允许独立控制头部和底盘；底盘 `MOVE` 必须持续刷新。
-- `FOLLOW`：接收 `TARGET` 并可驱动头部；自动底盘跟随当前仍关闭，等待 bbox 距离阈值实机标定。
+- `FOLLOW`：`TARGET` 驱动头部，LongPet 通过独立租约的 `FOLLOW_MOVE` 请求低速前进或原地对齐。
 
 只有**实际切换到不同模式**时才会执行模式切换停车与瞬态状态清理；重复发送当前模式是 no-op。
 
@@ -78,6 +78,11 @@ MOVE ROTATE_LEFT <speed>
 MOVE ROTATE_RIGHT <speed>
 MOVE SHIFT_LEFT <speed>
 MOVE SHIFT_RIGHT <speed>
+
+FOLLOW_MOVE FORWARD <speed>
+FOLLOW_MOVE ROTATE_LEFT <speed>
+FOLLOW_MOVE ROTATE_RIGHT <speed>
+FOLLOW_MOVE STOP
 ```
 
 完整命令、合法模式、参数范围和 watchdog 语义见
@@ -92,6 +97,7 @@ MOVE SHIFT_RIGHT <speed>
 ```text
 link timeout          = 500 ms
 manual MOVE lease     = 500 ms
+FOLLOW_MOVE lease     = 500 ms
 target freshness      = 500 ms
 ```
 
@@ -103,7 +109,7 @@ target freshness      = 500 ms
 - 如果持续用 `PING` / `STATUS` 等保持 general link 新鲜、但不刷新 `MOVE`，约 500 ms 后记录 `MANUAL_COMMAND_TIMEOUT`；
 - 两种情况都会安全停车。
 
-`PING` 不能延长 MANUAL `MOVE` lease，也不能延长视觉目标 TTL。
+`PING` 不能延长 MANUAL `MOVE` lease、FOLLOW_MOVE lease，也不能延长视觉目标 TTL。
 
 ## 视觉模块数据接口
 
@@ -135,8 +141,9 @@ TARGET dx dy area
 ...
 ```
 
-Detector + Tracker 架构应由独立 UART Publisher 以约 `10 Hz` 发布最新且仍然新鲜的目标，
-不要把发送节奏绑定到较慢的 Detector 推理完成事件。
+Detector + Tracker 每产生一个新的、仍然新鲜的 observation 才发布一次 `TARGET`；同一
+frame sequence 不得为了凑固定频率而重复发送。Detector 阻塞或目标过期时发送一次
+`TARGET 0 0 0`，通用 UART 心跳不能伪造 target freshness。
 
 ## IMU 兼容
 
@@ -169,7 +176,9 @@ software   = 870 ~ 2270 us
 max step   = 100 us / command
 ```
 
-实机已经确认 `HEAD LEFT`、`HEAD RIGHT`、`HEAD CENTER` 正常，机械总活动范围约 `120°`。
+当前装配采用“pulse 增大为物理向左、pulse 减小为物理向右”的统一映射。V2.2 已据此修正
+此前相反的 LEFT/RIGHT 协议语义，并让 `HEAD` 与 `TARGET` 共用该映射；用户已确认 V2.2 实机通过。
+V2.3 STATUS 新增 `head_offset`，固定负值为物理左、正值为物理右，LongPet 不再解释 raw pulse 正负。
 
 ## 重要安全边界
 
@@ -177,7 +186,7 @@ max step   = 100 us / command
 - `POWER_ON`、`STOP_COMMAND`、`TARGET_LOST`、`LINK_TIMEOUT`、`MODE_CHANGED`、`MANUAL_COMMAND_TIMEOUT` 为可恢复停车。
 - IMU 运行故障、转弯超时、控制周期严重超期为锁存故障，必须复位后恢复。
 - `HEAD_ONLY` 在执行器分发层硬阻止轮子动作。
-- `FOLLOW` 当前不执行自动底盘追踪。
+- `FOLLOW` 只执行 FORWARD / ROTATE_LEFT / ROTATE_RIGHT / STOP，且 500 ms 独立租约超时即停车；PING、STATUS、TARGET 均不能续租。
 - `MOVE SHIFT_LEFT/RIGHT` 协议保留，但本轮实机表现存在问题，现阶段不要作为依赖功能。
 - 软件不能替代硬件急停；正式落地仍建议 STBY 外部下拉和独立硬件急停。
 
@@ -202,7 +211,8 @@ max step   = 100 us / command
 | `MOVE SHIFT_RIGHT` | ⚠️ 实机存在问题，暂缓 |
 | Servo LEFT / RIGHT / CENTER | ✅ 正常 |
 | Servo 实际总行程 | ✅ 约 120° |
-| FOLLOW 自动底盘 | ⏸️ 当前故意关闭 |
+| V2.2 HEAD_ONLY 闭环 | ✅ 用户已确认通过 |
+| V2.3 FOLLOW 自动底盘 | ⏳ 软件已完成，硬件待用户测试 |
 | STOP / timeout / 断线 / fault 全套安全矩阵 | ⏳ 仍需逐项补测 |
 | 底盘 + Servo 并发 | ⏳ 已准备测试方法，尚未记录最终实测结论 |
 

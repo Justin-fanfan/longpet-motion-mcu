@@ -12,6 +12,8 @@
 #include <string.h>
 
 #include "motion_config.h"
+#include "head_direction.h"
+#include "follow_safety.h"
 #include "running.h"
 
 namespace Pins {
@@ -70,6 +72,7 @@ enum class StopReason : uint8_t {
     LinkTimeout,
     ModeChanged,
     ManualCommandTimeout,
+    FollowCommandTimeout,
     TargetTrackingOnly,
     FollowChassisDisabled,
     ImuInitFailed,
@@ -101,6 +104,8 @@ int servoPulseUs = MotionConfig::kServoCenterUs;
 TargetFrame currentTarget;
 int manualMotionSpeed = 0;
 bool manualMotionActive = false;
+int followMotionSpeed = 0;
+bool followMotionActive = false;
 
 char serialLine[MotionConfig::kSerialLineCapacity] = {};
 size_t serialLineLength = 0;
@@ -112,6 +117,7 @@ bool haveValidLinkCommand = false;
 bool linkTimedOut = false;
 uint32_t lastValidLinkCommandMs = 0;
 uint32_t lastManualMotionCommandMs = 0;
+uint32_t lastFollowMotionCommandMs = 0;
 uint32_t lastTargetCommandMs = 0;
 uint32_t lastControlMs = 0;
 uint32_t turnStartedMs = 0;
@@ -127,6 +133,7 @@ void setStopped(StopReason reason);
 void latchFault(StopReason reason);
 void changeControlMode(ControlMode mode);
 bool startManualMotion(MotionMode mode, int speed, uint32_t now);
+bool startFollowMotion(MotionMode mode, int speed, uint32_t now);
 bool parseIntegerToken(const char* token, int32_t& value);
 bool nextToken(const char*& cursor, char* token, size_t tokenCapacity);
 bool noMoreTokens(const char* cursor);
@@ -201,6 +208,7 @@ const char* stopReasonName(StopReason reason) {
     case StopReason::LinkTimeout: return "LINK_TIMEOUT";
     case StopReason::ModeChanged: return "MODE_CHANGED";
     case StopReason::ManualCommandTimeout: return "MANUAL_COMMAND_TIMEOUT";
+    case StopReason::FollowCommandTimeout: return "FOLLOW_COMMAND_TIMEOUT";
     case StopReason::TargetTrackingOnly: return "TARGET_TRACKING_ONLY";
     case StopReason::FollowChassisDisabled: return "FOLLOW_CHASSIS_DISABLED";
     case StopReason::ImuInitFailed: return "IMU_INIT_FAILED";
@@ -250,7 +258,10 @@ void setStopped(StopReason reason) {
     stopReason = reason;
     manualMotionActive = false;
     manualMotionSpeed = 0;
+    followMotionActive = false;
+    followMotionSpeed = 0;
     lastManualMotionCommandMs = 0;
+    lastFollowMotionCommandMs = 0;
     turnStartedMs = 0;
     if (wasContinuousRotation) {
         car.syncAimToCurrentHeading();
@@ -286,9 +297,12 @@ void changeControlMode(ControlMode mode) {
     targetAvailable = false;
     currentTarget = TargetFrame{};
     lastManualMotionCommandMs = 0;
+    lastFollowMotionCommandMs = 0;
     lastTargetCommandMs = 0;
     manualMotionActive = false;
     manualMotionSpeed = 0;
+    followMotionActive = false;
+    followMotionSpeed = 0;
     controlMode = mode;
     Serial1.printf("[MODE] %s\n", controlModeName(controlMode));
 }
@@ -315,6 +329,43 @@ bool startManualMotion(MotionMode mode, int speed, uint32_t now) {
     manualMotionSpeed = speed;
     manualMotionActive = true;
     lastManualMotionCommandMs = now;
+    return true;
+}
+
+bool startFollowMotion(MotionMode mode, int speed, uint32_t now) {
+    if (faultLatched || controlMode != ControlMode::Follow) {
+        return false;
+    }
+    if (mode == MotionMode::Stopped) {
+        setStopped(StopReason::StopCommand);
+        // STOP is a valid FOLLOW command but never starts a lease.
+        return true;
+    }
+    if (mode != MotionMode::Forward
+        && mode != MotionMode::RotateLeft
+        && mode != MotionMode::RotateRight) {
+        return false;
+    }
+
+    const bool commandChanged = motionMode != mode
+        || followMotionSpeed != speed || !followMotionActive;
+    if (commandChanged) {
+        const bool wasContinuousRotation =
+            motionMode == MotionMode::RotateLeft
+            || motionMode == MotionMode::RotateRight;
+        if (wasContinuousRotation) {
+            car.syncAimToCurrentHeading();
+        }
+        car.Stop();
+        motionMode = mode;
+        Serial1.printf("[FOLLOW] %s speed=%d\n",
+                       motionModeName(mode), speed);
+    }
+    manualMotionActive = false;
+    manualMotionSpeed = 0;
+    followMotionSpeed = speed;
+    followMotionActive = true;
+    lastFollowMotionCommandMs = now;
     return true;
 }
 
@@ -433,9 +484,8 @@ void updateHeadFromTarget(int32_t dx, uint32_t now) {
     correction = constrain(correction, 1,
                            MotionConfig::kHeadMaximumCorrectionPerTargetUs);
 
-    const int64_t signedCorrection = dx > 0 ? correction : -correction;
     const int64_t requested = static_cast<int64_t>(servoPulseUs)
-        - signedCorrection;
+        + HeadDirection::pulseDeltaForTargetDx(dx, correction);
     const int bounded = constrain(static_cast<int>(requested),
                                   MotionConfig::kServoMinimumUs,
                                   MotionConfig::kServoMaximumUs);
@@ -460,9 +510,9 @@ bool handleHeadCommand(const char* action, int step, uint32_t now) {
 
     int requested = servoPulseUs;
     if (strcmp(action, "LEFT") == 0) {
-        requested -= step;
+        requested += HeadDirection::pulseDeltaForPhysicalLeft(step);
     } else if (strcmp(action, "RIGHT") == 0) {
-        requested += step;
+        requested += HeadDirection::pulseDeltaForPhysicalRight(step);
     } else if (strcmp(action, "CENTER") == 0) {
         requested = MotionConfig::kServoCenterUs;
     } else {
@@ -493,11 +543,11 @@ void handleValidTarget(const TargetFrame& frame, uint32_t now) {
     targetAvailable = true;
     updateHeadFromTarget(frame.dx, now);
 
-    // FOLLOW chassis control is intentionally disabled until the bbox area
-    // thresholds are calibrated. Neither mode has an implicit wheel path.
-    setStopped(controlMode == ControlMode::Follow
-                   ? StopReason::FollowChassisDisabled
-                   : StopReason::TargetTrackingOnly);
+    // TARGET only moves the head. In FOLLOW it must not stop or renew the
+    // independent chassis lease; LongPet follows with explicit FOLLOW_MOVE.
+    if (controlMode == ControlMode::HeadOnly) {
+        setStopped(StopReason::TargetTrackingOnly);
+    }
 }
 
 void markValidLinkCommand(uint32_t now) {
@@ -511,10 +561,11 @@ void markValidLinkCommand(uint32_t now) {
 
 void reportStatus() {
     Serial1.printf("[STATUS] mode=%s motion=%s stop=%s fault=%d target=%d "
-                   "servo=%d imu=%d\n",
+                   "servo=%d head_offset=%d imu=%d\n",
                    controlModeName(controlMode), motionModeName(motionMode),
                    stopReasonName(stopReason), faultLatched ? 1 : 0,
                    targetAvailable ? 1 : 0, servoPulseUs,
+                   HeadDirection::physicalOffsetUsForPulse(servoPulseUs),
                    car.imuReady() ? 1 : 0);
 }
 
@@ -622,6 +673,38 @@ bool handleCommandLine(const char* line, uint32_t now) {
             return false;
         }
         return startManualMotion(requestedMotion, speed, now);
+    }
+    if (strcmp(command, "FOLLOW_MOVE") == 0) {
+        if (faultLatched || controlMode != ControlMode::Follow) {
+            return false;
+        }
+        char direction[20] = {};
+        if (!nextToken(cursor, direction, sizeof(direction))) {
+            return false;
+        }
+        if (strcmp(direction, "STOP") == 0) {
+            return noMoreTokens(cursor)
+                && startFollowMotion(MotionMode::Stopped, 0, now);
+        }
+        char speedToken[20] = {};
+        int speed = 0;
+        if (!nextToken(cursor, speedToken, sizeof(speedToken))
+            || !noMoreTokens(cursor)
+            || !parseSpeedToken(speedToken, speed)) {
+            return false;
+        }
+        MotionMode requestedMotion = MotionMode::Stopped;
+        if (strcmp(direction, "FORWARD") == 0) {
+            requestedMotion = MotionMode::Forward;
+        } else if (strcmp(direction, "ROTATE_LEFT") == 0) {
+            requestedMotion = MotionMode::RotateLeft;
+        } else if (strcmp(direction, "ROTATE_RIGHT") == 0) {
+            requestedMotion = MotionMode::RotateRight;
+        } else {
+            // BACKWARD, SHIFT and arc commands are deliberately absent.
+            return false;
+        }
+        return startFollowMotion(requestedMotion, speed, now);
     }
 
     // Legacy `dx dy area` is syntax compatibility only. It follows TARGET
@@ -742,6 +825,14 @@ void checkMotionTimeouts(uint32_t now) {
         return;
     }
 
+    if (controlMode == ControlMode::Follow && followMotionActive
+        && FollowSafety::leaseExpired(
+            now, lastFollowMotionCommandMs,
+            MotionConfig::kFollowCommandTimeoutMs)) {
+        setStopped(StopReason::FollowCommandTimeout);
+        return;
+    }
+
 }
 
 void runControlCycle(uint32_t now) {
@@ -764,14 +855,15 @@ void runControlCycle(uint32_t now) {
         return;
     }
 
-    // The current firmware has no automatic chassis path in SAFE, HEAD_ONLY,
-    // or FOLLOW. Keep this guard next to the actuator dispatch so a stale or
-    // accidentally populated motion state cannot move the wheels there.
-    if (controlMode != ControlMode::Manual || !manualMotionActive) {
-        setStopped(controlMode == ControlMode::Follow
-                       ? StopReason::FollowChassisDisabled
-                       : controlMode == ControlMode::HeadOnly
-                           ? StopReason::TargetTrackingOnly
+    const bool manualDrive = controlMode == ControlMode::Manual
+        && manualMotionActive;
+    const bool followDrive = controlMode == ControlMode::Follow
+        && followMotionActive;
+    if (!manualDrive && !followDrive) {
+        setStopped(controlMode == ControlMode::HeadOnly
+                       ? StopReason::TargetTrackingOnly
+                       : controlMode == ControlMode::Follow
+                           ? StopReason::FollowChassisDisabled
                            : StopReason::ModeChanged);
         return;
     }
@@ -791,7 +883,8 @@ void runControlCycle(uint32_t now) {
         car.Stop();
         return;
     case MotionMode::Forward:
-        result = car.Forward(manualMotionSpeed,
+        result = car.Forward(followDrive ? followMotionSpeed
+                                         : manualMotionSpeed,
                              elapsedSeconds);
         break;
     case MotionMode::Backward:
@@ -799,10 +892,14 @@ void runControlCycle(uint32_t now) {
                              elapsedSeconds);
         break;
     case MotionMode::RotateLeft:
-        result = car.RotateLeft(manualMotionSpeed, elapsedSeconds);
+        result = car.RotateLeft(followDrive ? followMotionSpeed
+                                            : manualMotionSpeed,
+                                elapsedSeconds);
         break;
     case MotionMode::RotateRight:
-        result = car.RotateRight(manualMotionSpeed, elapsedSeconds);
+        result = car.RotateRight(followDrive ? followMotionSpeed
+                                             : manualMotionSpeed,
+                                 elapsedSeconds);
         break;
     case MotionMode::LeftTurn:
         result = car.LeftTurn(manualMotionSpeed,

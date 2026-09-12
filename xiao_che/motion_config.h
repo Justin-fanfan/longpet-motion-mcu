@@ -1,7 +1,8 @@
 #ifndef MOTION_CONFIG_H
 #define MOTION_CONFIG_H
 
-#include <Arduino.h>
+#include <stddef.h>
+#include <stdint.h>
 
 namespace MotionConfig {
 
@@ -13,6 +14,7 @@ constexpr uint32_t kLinkTimeoutMs = 500;
 // These timeouts intentionally have separate names and timestamps in the
 // sketch. A PING can refresh the link timeout, but never a motion lease.
 constexpr uint32_t kManualCommandTimeoutMs = 500;
+constexpr uint32_t kFollowCommandTimeoutMs = 500;
 constexpr uint32_t kTargetTimeoutMs = 500;
 constexpr uint32_t kTurnTimeoutMs = 3000;
 constexpr uint32_t kDiagnosticRepeatMs = 2000;
@@ -37,8 +39,9 @@ constexpr int kHeadDefaultStepUs = 20;
 constexpr int kHeadMaximumStepUs = 100;
 constexpr int kHeadMaximumCorrectionPerTargetUs = 40;
 
-// Temporary pixel-area thresholds retained for future FOLLOW calibration.
-// They must not drive the chassis in the current firmware.
+// Legacy pixel-area constants retained for source history only. V2.3 distance
+// classification uses normalized bbox height in LongPet; MCU firmware never
+// uses these values to drive the chassis.
 constexpr int32_t kFarAreaExclusive = 5000;
 constexpr int32_t kNearAreaExclusive = 10000;
 
@@ -48,6 +51,11 @@ constexpr int kServoCenterUs = 1570;
 constexpr int kServoMaximumUs = 2270;
 constexpr int kServoMinimumPulseUs = 500;
 constexpr int kServoMaximumPulseUs = 2500;
+// Physical installation mapping. On the current LongPet head, increasing the
+// pulse turns the real head left and decreasing it turns right. HEAD and
+// TARGET must both use this single mapping instead of carrying independent
+// sign conventions.
+constexpr int kServoPhysicalLeftPulseSign = 1;
 
 // Commands are controller units, not cm/s.
 constexpr int kTrackingSpeedCommand = 20;
@@ -72,10 +80,15 @@ static_assert(kLinkTimeoutMs > kControlPeriodMs,
               "link timeout must allow at least one control period");
 static_assert(kManualCommandTimeoutMs > kControlPeriodMs,
               "manual timeout must allow at least one control period");
+static_assert(kFollowCommandTimeoutMs > kControlPeriodMs,
+              "follow timeout must allow at least one control period");
 static_assert(kTargetTimeoutMs > kControlPeriodMs,
               "target timeout must allow at least one control period");
 static_assert(kHeadMaximumStepUs >= kHeadDefaultStepUs,
               "maximum head step must cover the default step");
+static_assert(kServoPhysicalLeftPulseSign == -1
+                  || kServoPhysicalLeftPulseSign == 1,
+              "servo physical direction sign must be -1 or 1");
 
 }  // namespace MotionConfig
 

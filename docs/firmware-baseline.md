@@ -1,6 +1,6 @@
 # LongPet ESP32-S3 Motion Controller 固件基线
 
-日期：2026-09-11
+日期：2026-09-12
 
 本文档记录当前 `main` 分支的 V2 固件行为、硬件资源、已验证结论与仍未验证项。
 历史 V1 自动跟随逻辑已经退出当前执行路径；协议细节以
@@ -16,7 +16,7 @@ Serial1 bounded byte poll
   -> strict V2 parser / legacy target parser
   -> mode legality + freshness timestamps
   -> recoverable stop / latched fault
-  -> MANUAL-only chassis dispatch
+  -> MANUAL MOVE / FOLLOW_MOVE ownership dispatch
   -> Run::Forward/Backward/LeftShift/RightShift/RotateLeft/RotateRight
   -> encoder PID + heading PID
   -> LEDC 4..7 + TB6612 STBY
@@ -29,7 +29,7 @@ Serial1 bounded byte poll
 | `SAFE` | 默认模式；底盘保持停止 |
 | `HEAD_ONLY` | `TARGET` 只驱动头部；底盘执行路径硬阻断 |
 | `MANUAL` | `HEAD` 与新鲜 `MOVE` 独立工作 |
-| `FOLLOW` | 接收 `TARGET`、可动头部；自动底盘跟随关闭 |
+| `FOLLOW` | `TARGET` 跟头；只执行独立租约的 FORWARD / ROTATE_LEFT / ROTATE_RIGHT / STOP |
 
 只有真正切换到不同模式时才执行模式切换停车与瞬态状态清理；重复发送当前模式是 no-op。
 
@@ -96,6 +96,7 @@ CR / LF / CRLF         = accepted
 - `MANUAL_COMMAND_TIMEOUT`
 - `TARGET_TRACKING_ONLY`
 - `FOLLOW_CHASSIS_DISABLED`
+- `FOLLOW_COMMAND_TIMEOUT`
 
 ### 锁存故障
 
@@ -116,11 +117,12 @@ Servo 不因 STOP 自动回中。
 
 ## 5. Timeout 基线
 
-当前三个主要时间参数都是 500 ms：
+当前四个主要时间参数都是 500 ms：
 
 ```text
 kLinkTimeoutMs          = 500
 kManualCommandTimeoutMs = 500
+kFollowCommandTimeoutMs = 500
 kTargetTimeoutMs        = 500
 ```
 
@@ -129,6 +131,7 @@ kTargetTimeoutMs        = 500
 - `lastValidLinkCommandMs`：任意完整且模式合法的命令刷新；
 - `lastManualMotionCommandMs`：仅 MANUAL `MOVE` 刷新；
 - `lastTargetCommandMs`：仅 HEAD_ONLY/FOLLOW `TARGET` 刷新。
+- `lastFollowMotionCommandMs`：仅 FOLLOW `FOLLOW_MOVE` 刷新；PING、STATUS、TARGET 均不刷新。
 
 当前 MANUAL 活动底盘的检查顺序是 general link timeout 在前、manual lease 在后。因此：
 
@@ -199,12 +202,13 @@ max command step = 100 us
 当前方向定义：
 
 ```text
-HEAD LEFT  -> pulse decreases
-HEAD RIGHT -> pulse increases
+HEAD LEFT  -> physical left  -> pulse increases
+HEAD RIGHT -> physical right -> pulse decreases
 HEAD CENTER -> 1570 us
 ```
 
-实机已经确认左右转动和回中正常，机械总活动范围约 `120°`。
+V2.2 根据后续实机反馈修正了此前相反的 LEFT/RIGHT 协议语义，`HEAD` 与 `TARGET` 现统一经过
+`head_direction.h` 映射。机械总活动范围仍约 `120°`；新方向固件需要用户重烧后重新确认。
 
 原先对 Servo PWM 资源冲突的担忧没有表现为“舵机完全不可用”：当前舵机已实机动作正常。
 但本轮尚未记录 Servo 与四轮同时运行时的最终长时间并发结论，因此并发资源仍保留为待完整验收项。
@@ -268,7 +272,7 @@ area 0..16777216
 - `dy` 只保存；
 - `area` 是 bbox 像素面积，不是物理距离；
 - `area == 0` 表示 target lost；
-- 5000 / 10000 旧阈值仍保留在配置中，但当前 FOLLOW 不使用。
+- 5000 / 10000 旧阈值仍保留但不使用；距离分级由 LongPet 使用归一化 bbox 高度完成。
 
 HEAD_ONLY 修正参数：
 
@@ -298,7 +302,9 @@ max correction per target  = 40 us
 | Servo Left / Right / Center | 实机正常 |
 | Servo 机械范围 | 约 120° |
 | STOP / timeout / disconnect / fault 全矩阵 | 未全部逐项记录 |
-| HEAD_ONLY 视觉目标实机闭环 | 尚待龙芯视觉端联调 |
+| HEAD_ONLY 视觉目标实机闭环 | 用户已确认 V2.2 通过 |
+| FOLLOW_MOVE 独立租约 host 测试 | 已通过 |
+| V2.3 人物跟随硬件闭环 | 待用户测试 |
 | Servo + chassis 并发 | 尚未记录最终验收结论 |
 
 因此当前可以进入龙芯 UART 与视觉 HEAD_ONLY 联调，但不能把整个 35 项安全矩阵称为“全部硬件验收通过”。
@@ -334,5 +340,5 @@ SPI 2.0.0
 - 60 mm 轮径本身不足以把内部速度量换算成真实 cm/s，仍缺完整编码器/减速比标定；
 - 精确角度转弯的误差、2°容差和 TURN_TIMEOUT 尚未完成系统验收；
 - 软件 watchdog 不能代替 STBY 外部下拉、保险/限流和硬件急停；
-- FOLLOW 必须先完成 bbox area / distance 标定，再单独设计自动底盘策略；
-- 下一阶段优先：龙芯 UART -> STATUS/PING/STOP -> MANUAL -> HEAD -> HEAD_ONLY -> 视觉 TARGET。
+- V2.3 已使用 normalized bbox height 设计距离滞回，现场阈值仍需按标定指南测量；
+- 下一阶段优先：烧录 V2.3 -> 验证 head_offset -> 台架租约 -> 悬空轮组 -> 低速落地跟随。

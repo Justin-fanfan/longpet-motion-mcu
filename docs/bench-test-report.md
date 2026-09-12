@@ -93,8 +93,8 @@ void loop() {
 
 | # | 操作 | 当前结果 |
 |---:|---|---|
-| 17 | `HEAD LEFT` | ✅ 正常 |
-| 18 | `HEAD RIGHT` | ✅ 正常 |
+| 17 | `HEAD LEFT` | ⏳ V2.2 已按实机反馈反转映射，待重烧后确认真实向左 |
+| 18 | `HEAD RIGHT` | ⏳ V2.2 已按实机反馈反转映射，待重烧后确认真实向右 |
 | 19 | `HEAD CENTER` | ✅ 正常 |
 | 20 | 实际机械总行程 | ✅ 约 120° |
 | 21 | 870/2270 us 软件极限逐点边界验证 | ⏳ 尚未单独记录 |
@@ -168,10 +168,24 @@ void loop() {
 
 | # | 操作 | 预期 | 状态 |
 |---:|---|---|---|
-| 45 | HEAD_ONLY 约 10 Hz `TARGET` | 头部连续跟踪 | ⏳ |
-| 46 | Detector correction 较慢时 Tracker 更新 | Publisher 仍保持约 10 Hz 最新目标 | ⏳ |
+| 45 | HEAD_ONLY 接收每个约 7 Hz 的新鲜 observation | 每个新 frameSequence 最多执行一次，头部连续跟踪 | ⏳ |
+| 46 | Detector correction 阻塞超过 target expiry | 不重复旧 dx；一次 `TARGET 0 0 0` 后等待新帧 | ⏳ |
 | 47 | 目标 stale / lost | 发送 `TARGET 0 0 0`，不保留旧目标 | ⏳ |
-| 48 | FOLLOW `TARGET` | 当前不得驱动底盘 | ⏳ |
+| 48 | FOLLOW `TARGET` | 只动头部，不启动/续租底盘 | ⏳ |
+| 49 | 非 FOLLOW 模式发送 `FOLLOW_MOVE FORWARD 10` | 拒绝，轮组不动 | ⏳ |
+| 50 | FOLLOW 中持续发送新 `TARGET`，只发一次 `FOLLOW_MOVE` | 约 500 ms `FOLLOW_COMMAND_TIMEOUT` 停车 | ⏳ |
+| 51 | FOLLOW 中持续 PING/STATUS，停止 `FOLLOW_MOVE` | 独立租约仍约 500 ms 停车 | ⏳ |
+| 52 | FOLLOW 中约 7 Hz 刷新 `FOLLOW_MOVE ROTATE_LEFT 10` | 持续低速原地左转 | ⏳ |
+| 53 | `FOLLOW_MOVE STOP` | 立即停车并清跟随租约 | ⏳ |
+| 54 | FOLLOW 尝试 BACKWARD/SHIFT | 命令拒绝，轮组不动 | ⏳ |
+| 55 | FOLLOW 运动中切 SAFE / MANUAL / HEAD_ONLY | 立即停车并清租约 | ⏳ |
+| 56 | FOLLOW 运动中拔 UART | 最迟约 500 ms 停车 | ⏳ |
+| 57 | 重新接 UART | MCU 可仍报告原模式，但保持 STOP、不恢复旧 FOLLOW_MOVE；上位机负责重新收敛到 SAFE | ⏳ |
+| 58 | STATUS 查看 `head_offset` | 头左为负、回中约 0、头右为正 | ⏳ |
+
+V2.2 新增的 host 逻辑测试已验证：物理 LEFT 对应正脉宽增量、物理 RIGHT 对应负脉宽增量，
+`dx < 0` 与 `HEAD LEFT` 共用同一映射，`dx > 0` 与 `HEAD RIGHT` 共用同一映射。该结果只证明代码
+语义一致，不替代烧录后的舵机实测。
 
 ---
 
@@ -217,4 +231,5 @@ HEAD 日志有约 2 秒限频，因此快速重复 HEAD 时不要要求每条命
 - FOLLOW 自动跟随已可用；
 - 左右平移已经正常。
 
-下一阶段优先完成龙芯 UART 与 HEAD_ONLY 视觉联调，同时逐项补齐本文件中的 ⏳ 项。
+V2.2 HEAD_ONLY 已由用户确认实机通过。V2.3 软件与 host 安全测试已完成，但 49～58 和整机人物跟随
+仍必须由用户按 LongPet 主仓库的 V2.3 Test Guide 实测，当前不得标为硬件 PASS。
