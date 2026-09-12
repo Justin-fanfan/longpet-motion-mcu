@@ -30,7 +30,7 @@ ESP32-S3 Serial1 TX = GPIO7
 | `SAFE` | 默认安全态 | 底盘保持停止 |
 | `HEAD_ONLY` | 视觉头部跟踪 | `TARGET` 可动头部，轮子硬阻止 |
 | `MANUAL` | 手动/家属遥控 | `HEAD` 与持续刷新的 `MOVE` 独立工作 |
-| `FOLLOW` | 未来自动跟随 | `TARGET` 与头部链路已接通，自动底盘暂时关闭 |
+| `FOLLOW` | V2.3 人物跟随 | `TARGET` 只跟头；底盘只执行带独立租约的 `FOLLOW_MOVE` |
 
 上电后初始模式为 `SAFE`。
 
@@ -79,13 +79,13 @@ STATUS
 `STATUS` 从 **Serial1** 返回：
 
 ```text
-[STATUS] mode=<...> motion=<...> stop=<...> fault=<0|1> target=<0|1> servo=<us> imu=<0|1>
+[STATUS] mode=<...> motion=<...> stop=<...> fault=<0|1> target=<0|1> servo=<us> head_offset=<us> imu=<0|1>
 ```
 
 例如：
 
 ```text
-[STATUS] mode=MANUAL motion=STOPPED stop=STOP_COMMAND fault=0 target=0 servo=1570 imu=1
+[STATUS] mode=MANUAL motion=STOPPED stop=STOP_COMMAND fault=0 target=0 servo=1570 head_offset=0 imu=1
 ```
 
 ### 3.2 Vision target
@@ -119,11 +119,13 @@ area = bbox_width * bbox_height
 - deadband：10 px；
 - 单次最大 correction：40 us；
 - Servo clamp：870..2270 us；
-- `dx > 0` 时 pulse 减小，`dx < 0` 时 pulse 增大。
+- `dx < 0` 时按“物理向左”映射调整，`dx > 0` 时按“物理向右”映射调整；
+- 当前装配 `kServoPhysicalLeftPulseSign=+1`，因此物理向左为 pulse 增大、物理向右为 pulse 减小。
 
 `HEAD_ONLY` 中 `TARGET` 永远不能进入底盘执行路径。
 
-`FOLLOW` 当前也不会依据 `area` 驱动底盘；5000/10000 仅是旧阈值保留值，尚未针对当前视觉 bbox 标定。
+`FOLLOW` 不会依据像素 `area` 自主决策底盘。距离和头身策略位于 LongPet，MCU 只执行显式
+`FOLLOW_MOVE`。5000/10000 是未使用的旧阈值。
 
 ### 3.3 Head commands
 
@@ -145,10 +147,13 @@ HEAD CENTER
 当前方向定义：
 
 ```text
-LEFT  -> pulse -= step
-RIGHT -> pulse += step
+LEFT  -> physical left  -> pulse += step
+RIGHT -> physical right -> pulse -= step
 CENTER -> 1570 us
 ```
+
+`HEAD` 和 `TARGET` 均调用 `head_direction.h` 中的同一物理方向映射。若未来更换舵机或改变安装方向，
+只调整 `motion_config.h` 的 `kServoPhysicalLeftPulseSign`，不要在协议解析或 UI 中交换 LEFT/RIGHT。
 
 位置始终 clamp 到：
 
@@ -197,6 +202,25 @@ SHIFT_RIGHT   known issue / deferred
 
 左右平移协议保留，但现阶段不要作为 LongPet 必需功能。
 
+### 3.5 FOLLOW chassis commands
+
+```text
+FOLLOW_MOVE FORWARD <speed>
+FOLLOW_MOVE ROTATE_LEFT <speed>
+FOLLOW_MOVE ROTATE_RIGHT <speed>
+FOLLOW_MOVE STOP
+```
+
+只在 `MODE FOLLOW` 合法。没有 BACKWARD、SHIFT 或弧线命令；V2.3 策略只允许低速前进和原地对齐。
+每条非 STOP `FOLLOW_MOVE` 都刷新独立的 `lastFollowMotionCommandMs`，默认租约 500 ms。以下命令均不续租：
+
+- `PING`；
+- `STATUS`；
+- `TARGET`；
+- MANUAL `MOVE`。
+
+租约到期产生 `FOLLOW_COMMAND_TIMEOUT` 并停车。`FOLLOW_MOVE STOP` 立即停车并清租约。
+
 ---
 
 ## 4. Watchdogs and timestamps
@@ -208,6 +232,7 @@ SHIFT_RIGHT   known issue / deferred
 | `lastValidLinkCommandMs` | 任意被接受的合法命令，包括 `PING` / `STATUS` / `MODE` | 500 ms |
 | `lastManualMotionCommandMs` | 仅 MANUAL `MOVE` | 500 ms |
 | `lastTargetCommandMs` | 仅 HEAD_ONLY/FOLLOW `TARGET` | 500 ms |
+| `lastFollowMotionCommandMs` | 仅 FOLLOW `FOLLOW_MOVE` | 500 ms |
 
 ### 4.1 MANUAL 实际 timeout 顺序
 
@@ -246,6 +271,7 @@ MOVE every 100..200 ms
 
 ```text
 TARGET about 10 Hz
+FOLLOW_MOVE with every newly evaluated target observation, about 7 Hz
 ```
 
 按钮释放或上层需要明确停车时应立即发送：
@@ -268,6 +294,7 @@ STOP
 - `LINK_TIMEOUT`
 - `MODE_CHANGED`
 - `MANUAL_COMMAND_TIMEOUT`
+- `FOLLOW_COMMAND_TIMEOUT`
 - `TARGET_TRACKING_ONLY`
 - `FOLLOW_CHASSIS_DISABLED`
 
@@ -366,14 +393,20 @@ TARGET -20 10 7300
 TARGET 0 8 0
 ```
 
-### 7.3 FOLLOW placeholder
+### 7.3 Person follow
 
 ```text
 MODE FOLLOW
 TARGET 15 0 7400
+FOLLOW_MOVE ROTATE_RIGHT 10
+TARGET 2 0 7600
+FOLLOW_MOVE FORWARD 12
+TARGET 0 0 0
+FOLLOW_MOVE STOP
 ```
 
-当前只允许目标/头部路径工作，不允许自动底盘追踪。
+LongPet 必须对每个新鲜 observation 重新评估策略，不能靠重复旧帧刷新 `FOLLOW_MOVE`。头偏时先原地转向；
+只有物理头偏进入回中滞回且距离为 FAR 时才前进。MCU 不参与 bbox 距离分类。
 
 ---
 
@@ -386,5 +419,5 @@ TARGET 15 0 7400
 - Forward / Backward / Rotate Left / Rotate Right：通过；
 - Shift Left / Shift Right：实机存在问题，暂缓；
 - Servo Left / Right / Center：通过，机械总活动范围约 120°；
-- 完整 STOP / timeout / 断线 / fault 安全矩阵：仍需逐项补测；
-- 底盘与 Servo 并发：已有测试方法，但尚未记录最终实测结论。
+- V2.2 HEAD_ONLY：用户已确认通过；
+- V2.3 FOLLOW_MOVE / 独立租约 / 头身与距离闭环：软件已完成，硬件待用户测试。
